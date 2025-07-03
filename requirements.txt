@@ -6,4 +6,6 @@ google-auth
 gspread
 PyMuPDF
 oauth2client
+scikit-learn
+
 
