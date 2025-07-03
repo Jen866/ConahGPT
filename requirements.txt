@@ -1,0 +1,7 @@
+Flask
+Flask-Cors
+google-generativeai
+google-api-python-client
+google-auth
+gspread
+PyMuPDF
