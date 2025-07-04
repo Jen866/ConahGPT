@@ -7,5 +7,6 @@ gspread
 PyMuPDF
 oauth2client
 scikit-learn
+gunicorn
 
 
