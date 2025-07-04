@@ -60,7 +60,7 @@ def read_google_sheet(file_id):
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
         return "\n".join([str(row) for row in sheet.get_all_records()])
-    except Exception as e:
+    except Exception:
         return ""
 
 def read_google_doc(file_id):
@@ -72,7 +72,7 @@ def read_google_doc(file_id):
                 for element in content_item["paragraph"].get("elements", []):
                     text += element.get("textRun", {}).get("content", "")
         return text
-    except Exception as e:
+    except Exception:
         return ""
 
 def read_pdf(file_id):
@@ -89,7 +89,7 @@ def read_pdf(file_id):
             for page in pdf_doc:
                 text += page.get_text()
         return text
-    except Exception as e:
+    except Exception:
         return ""
 
 # --- Chunking & Semantic Search ---
@@ -165,7 +165,5 @@ def ask():
 
 # --- Run Server ---
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
