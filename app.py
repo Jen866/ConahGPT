@@ -10,7 +10,7 @@ from whitenoise import WhiteNoise # Import WhiteNoise
 
 # --- Flask Setup ---
 app = Flask(__name__)
-# This tells your app how to serve static files like script.js and style.css in production
+# This tells your app how to serve static files like script.js and style.css in production.
 app.wsgi_app = WhiteNoise(app.wsgi_app, root='static/')
 CORS(app)
 
