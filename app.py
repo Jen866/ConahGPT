@@ -6,15 +6,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import drive_utils # Import our new utility file
+from whitenoise import WhiteNoise # Import WhiteNoise
 
 # --- Flask Setup ---
 app = Flask(__name__)
+# This tells your app how to serve static files like script.js and style.css in production
+app.wsgi_app = WhiteNoise(app.wsgi_app, root='static/')
 CORS(app)
+
 
 # --- Gemini Setup ---
 # Load API Key from environment variable for security
-# In your Render setup, you will need to set an environment variable
-# named GEMINI_API_KEY with your key.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("FATAL ERROR: The GEMINI_API_KEY environment variable is not set.")
