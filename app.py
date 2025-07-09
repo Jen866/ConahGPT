@@ -5,12 +5,11 @@ from flask_cors import CORS
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
-import drive_utils # Import our new utility file
+import drive_utils
 
 # --- Flask Setup ---
 app = Flask(__name__)
 CORS(app)
-
 
 # --- Gemini Setup ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -39,9 +38,7 @@ def get_relevant_chunks(question, chunks, top_k=5):
     doc_vectors = vectorizer.transform(documents)
     question_vector = vectorizer.transform([question])
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
-
     top_indices = [i for i in similarities.argsort()[-top_k:][::-1] if similarities[i] > 0.1]
-
     unique_chunks = []
     seen_links = set()
     for i in top_indices:
@@ -49,9 +46,7 @@ def get_relevant_chunks(question, chunks, top_k=5):
         if chunk['link'] not in seen_links:
             unique_chunks.append(chunk)
             seen_links.add(chunk['link'])
-
     return unique_chunks
-
 
 # --- Routes ---
 @app.route("/")
@@ -66,8 +61,10 @@ def ask():
     if not question:
         return jsonify({"answer": "Please enter a question."}), 400
 
-    folder_id = "1bS_LeR9Gcn0g22I7yWcQ-i5i1t5u1u3y"
-    chunks = drive_utils.extract_all_chunks_with_links(folder_id)
+    # THIS IS THE CORRECT SHARED DRIVE ID FROM YOUR ORIGINAL CODE
+    shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
+    # Using the corrected function name from drive_utils
+    chunks = drive_utils.extract_all_chunks_with_links(shared_drive_id)
 
     if not chunks:
         return jsonify({"answer": "I couldn’t read any usable files from Google Drive."})
