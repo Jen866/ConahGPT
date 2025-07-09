@@ -6,17 +6,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import drive_utils # Import our new utility file
-from whitenoise import WhiteNoise # Import WhiteNoise
 
 # --- Flask Setup ---
 app = Flask(__name__)
-# This tells your app how to serve static files like script.js and style.css in production.
-app.wsgi_app = WhiteNoise(app.wsgi_app, root='static/')
 CORS(app)
 
 
 # --- Gemini Setup ---
-# Load API Key from environment variable for security
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("FATAL ERROR: The GEMINI_API_KEY environment variable is not set.")
@@ -36,7 +32,6 @@ model = genai.GenerativeModel(
 
 # --- Semantic Search ---
 def get_relevant_chunks(question, chunks, top_k=5):
-    """Finds the most relevant chunks using TF-IDF and cosine similarity."""
     if not chunks:
         return []
     documents = [chunk["text"] for chunk in chunks]
@@ -47,7 +42,6 @@ def get_relevant_chunks(question, chunks, top_k=5):
 
     top_indices = [i for i in similarities.argsort()[-top_k:][::-1] if similarities[i] > 0.1]
 
-    # De-duplicate chunks from the same source to avoid sending redundant context
     unique_chunks = []
     seen_links = set()
     for i in top_indices:
@@ -62,7 +56,6 @@ def get_relevant_chunks(question, chunks, top_k=5):
 # --- Routes ---
 @app.route("/")
 def index():
-    # This will render the index.html file from the 'templates' folder
     return render_template("index.html")
 
 @app.route("/ask", methods=["POST"])
@@ -73,12 +66,11 @@ def ask():
     if not question:
         return jsonify({"answer": "Please enter a question."}), 400
 
-    # Your Google Drive Folder ID
     folder_id = "1bS_LeR9Gcn0g22I7yWcQ-i5i1t5u1u3y"
     chunks = drive_utils.extract_all_chunks_with_links(folder_id)
 
     if not chunks:
-        return jsonify({"answer": "I couldn’t read any usable files from Google Drive. Please double check that your folder contains readable Google Docs, Sheets, or PDFs."})
+        return jsonify({"answer": "I couldn’t read any usable files from Google Drive."})
 
     relevant_chunks = get_relevant_chunks(question, chunks)
     if not relevant_chunks:
@@ -89,11 +81,11 @@ def ask():
 
     try:
         gemini_response = model.generate_content(prompt)
-        answer = getattr(gemini_response, "text", "Oops, no answer returned from the model.")
+        answer = getattr(gemini_response, "text", "Oops, no answer returned.")
         return jsonify({"answer": answer})
     except Exception as e:
         print(f"Error calling Gemini API: {e}")
-        return jsonify({"answer": f"Server error when contacting the AI model: {str(e)}"}), 500
+        return jsonify({"answer": f"Server error: {str(e)}"}), 500
 
 # --- Run Server ---
 if __name__ == "__main__":
