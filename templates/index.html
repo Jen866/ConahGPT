@@ -38,12 +38,6 @@
       width: 60%;
       margin-left: auto;
       margin-right: auto;
-      padding: 10px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      background-color: #fff;
-      height: 400px;
-      overflow-y: auto;
     }
     .chat-line {
       margin-bottom: 10px;
@@ -63,168 +57,42 @@
 
   <div id="chat-box" class="chat-box"></div>
 
-  <!-- JavaScript is now inside the HTML file, just like your original version -->
   <script>
     async function sendMessage() {
-      const inputElement = document.getElementById("user-input");
+      const input = document.getElementById("user-input").value.trim();
+      if (!input) return;
+
       const chatBox = document.getElementById("chat-box");
-      const userText = inputElement.value.trim();
 
-      if (!userText) {
-        return;
-      }
-
-      // Display the user's question immediately
-      const userLine = document.createElement('div');
-      userLine.className = 'chat-line';
-      userLine.innerHTML = `<strong>You:</strong> ${userText}`;
+      // Show user's message
+      const userLine = document.createElement("div");
+      userLine.className = "chat-line";
+      userLine.innerHTML = `<strong>You:</strong> ${input}`;
       chatBox.appendChild(userLine);
-      
-      inputElement.value = ""; // Clear the input box
 
-      // Add a "loading" message
-      const loadingLine = document.createElement('div');
-      loadingLine.className = 'chat-line';
-      loadingLine.id = 'loading-indicator';
-      loadingLine.innerHTML = `<strong>Conah GPT:</strong> Thinking...`;
-      chatBox.appendChild(loadingLine);
-      chatBox.scrollTop = chatBox.scrollHeight;
+      // Clear input
+      document.getElementById("user-input").value = "";
 
       try {
-        const response = await fetch('/ask', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ question: userText })
+        const res = await fetch("/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: input })
         });
 
-        if (!response.ok) {
-          throw new Error(`HTTP error! Status: ${response.status}`);
-        }
+        const data = await res.json();
 
-        const data = await response.json();
-
-        // The answer from the backend already contains HTML, so we can set it directly
-        const botResponse = `<strong>Conah GPT:</strong> ${data.answer}`;
-        
-        // Replace the loading indicator with the actual answer
-        const finalLine = document.getElementById('loading-indicator');
-        finalLine.innerHTML = botResponse;
-        finalLine.id = ''; // remove id to prevent conflicts
-
-      } catch (error) {
-        console.error("Fetch Error:", error);
-        const errorResponse = `<div><strong style="color: red;">Error:</strong> Could not connect to the server.</div>`;
-        const errorLine = document.getElementById('loading-indicator');
-        errorLine.innerHTML = errorResponse;
-        errorLine.id = '';
+        const botLine = document.createElement("div");
+        botLine.className = "chat-line";
+        botLine.innerHTML = `<strong>Conah GPT:</strong> ${data.answer}`;
+        chatBox.appendChild(botLine);
+      } catch (err) {
+        const errorLine = document.createElement("div");
+        errorLine.className = "chat-line";
+        errorLine.innerHTML = `<strong>Conah GPT:</strong> Error talking to server.`;
+        chatBox.appendChild(errorLine);
       }
-
-      // Scroll to the bottom of the chat box
-      chatBox.scrollTop = chatBox.scrollHeight;
     }
   </script>
 </body>
 </html>
-```
-
-### 2. `app.py` (Cleaned Up)
-
-I have removed the `whitenoise` code that was causing the problem.
-
-
-```python
-import os
-import google.generativeai as genai
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
-import drive_utils # Import our new utility file
-
-# --- Flask Setup ---
-app = Flask(__name__)
-CORS(app)
-
-
-# --- Gemini Setup ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("FATAL ERROR: The GEMINI_API_KEY environment variable is not set.")
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(
-    model_name="models/gemini-1.5-pro",
-    system_instruction="""
-    You are Conah GPT, an expert business assistant for Actuary Consulting.
-    You answer questions based ONLY on the CONTEXT provided.
-    If the answer is not found in the context, you MUST say: 'I cannot answer this question as the information is not in the provided documents.'
-    When you cite a source from the context, you MUST use the exact link provided for that source.
-    Format the citation as a clickable HTML link at the end of your answer, like this: <a href="THE_LINK_FROM_CONTEXT" target="_blank">[Source: File Name]</a>.
-    Do not make up information. Be concise and professional.
-    """
-)
-
-# --- Semantic Search ---
-def get_relevant_chunks(question, chunks, top_k=5):
-    if not chunks:
-        return []
-    documents = [chunk["text"] for chunk in chunks]
-    vectorizer = TfidfVectorizer(stop_words='english').fit(documents + [question])
-    doc_vectors = vectorizer.transform(documents)
-    question_vector = vectorizer.transform([question])
-    similarities = cosine_similarity(question_vector, doc_vectors).flatten()
-
-    top_indices = [i for i in similarities.argsort()[-top_k:][::-1] if similarities[i] > 0.1]
-
-    unique_chunks = []
-    seen_links = set()
-    for i in top_indices:
-        chunk = chunks[i]
-        if chunk['link'] not in seen_links:
-            unique_chunks.append(chunk)
-            seen_links.add(chunk['link'])
-
-    return unique_chunks
-
-
-# --- Routes ---
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.get_json(force=True, silent=True) or {}
-    question = data.get("question", "").strip()
-
-    if not question:
-        return jsonify({"answer": "Please enter a question."}), 400
-
-    folder_id = "1bS_LeR9Gcn0g22I7yWcQ-i5i1t5u1u3y"
-    chunks = drive_utils.extract_all_chunks_with_links(folder_id)
-
-    if not chunks:
-        return jsonify({"answer": "I couldn’t read any usable files from Google Drive."})
-
-    relevant_chunks = get_relevant_chunks(question, chunks)
-    if not relevant_chunks:
-        return jsonify({"answer": "I cannot answer this question as the information is not in the provided documents."})
-
-    context = "\n\n".join([f"FROM {chunk['source']} (Link: {chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
-    prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"
-
-    try:
-        gemini_response = model.generate_content(prompt)
-        answer = getattr(gemini_response, "text", "Oops, no answer returned.")
-        return jsonify({"answer": answer})
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        return jsonify({"answer": f"Server error: {str(e)}"}), 500
-
-# --- Run Server ---
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
