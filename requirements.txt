@@ -8,6 +8,3 @@ PyMuPDF
 oauth2client
 scikit-learn
 gunicorn
-whitenoise
-
-
