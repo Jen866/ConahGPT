@@ -3,6 +3,7 @@ import io
 import fitz  # PyMuPDF
 import gspread
 import json
+import re
 import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -25,7 +26,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents.readonly"
 ]
 
-# Load creds from environment variable
 SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SERVICE_ACCOUNT_JSON), SCOPES)
 gspread_client = gspread.authorize(creds)
@@ -33,7 +33,7 @@ drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
 # --- Gemini Setup ---
-genai.configure(api_key="AIzaSyAbLRMFiD5GfK4kWqV3ndnki0_VN6iGIYE")  # Replace with your actual key
+genai.configure(api_key="AIzaSyAbLRMFiD5GfK4kWqV3ndnki0_VN6iGIYE")  # Replace with your key
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
@@ -60,7 +60,7 @@ def read_google_sheet(file_id):
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
         return "\n".join([str(row) for row in sheet.get_all_records()])
-    except Exception:
+    except:
         return ""
 
 def read_google_doc(file_id):
@@ -72,7 +72,7 @@ def read_google_doc(file_id):
                 for element in content_item["paragraph"].get("elements", []):
                     text += element.get("textRun", {}).get("content", "")
         return text
-    except Exception:
+    except:
         return ""
 
 def read_pdf(file_id):
@@ -89,10 +89,10 @@ def read_pdf(file_id):
             for page in pdf_doc:
                 text += page.get_text()
         return text
-    except Exception:
+    except:
         return ""
 
-# --- Chunking & Semantic Search ---
+# --- Chunking & Search ---
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
@@ -127,6 +127,10 @@ def get_relevant_chunks(question, chunks, top_k=5):
     top_indices = similarities.argsort()[-top_k:][::-1]
     return [chunks[i] for i in top_indices if similarities[i] > 0.1]
 
+# --- Convert Markdown to HTML ---
+def convert_md_links_to_html(text):
+    return re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank">\1</a>', text)
+
 # --- Routes ---
 @app.route("/")
 def index():
@@ -158,21 +162,9 @@ def ask():
 
     try:
         gemini_response = model.generate_content(prompt)
-        answer = getattr(gemini_response, "text", "Oops, no answer returned.")
-
-        # Add clean "Sources" section with links
-        unique_sources = {}
-        for chunk in relevant_chunks:
-            if chunk["link"] not in unique_sources:
-                unique_sources[chunk["link"]] = chunk["source"]
-
-        if unique_sources:
-            answer += "\n\n---\n**Sources:**\n"
-            for link, name in unique_sources.items():
-                answer += f"- [{name}]({link})\n"
-
+        raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
+        answer = convert_md_links_to_html(raw_answer)
         return jsonify({"answer": answer})
-
     except Exception as e:
         return jsonify({"answer": f"Server error: {str(e)}"}), 500
 
