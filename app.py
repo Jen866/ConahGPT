@@ -60,7 +60,7 @@ def read_google_sheet(file_id):
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
         return "\n".join([str(row) for row in sheet.get_all_records()])
-    except Exception as e:
+    except Exception:
         return ""
 
 def read_google_doc(file_id):
@@ -72,7 +72,7 @@ def read_google_doc(file_id):
                 for element in content_item["paragraph"].get("elements", []):
                     text += element.get("textRun", {}).get("content", "")
         return text
-    except Exception as e:
+    except Exception:
         return ""
 
 def read_pdf(file_id):
@@ -89,7 +89,7 @@ def read_pdf(file_id):
             for page in pdf_doc:
                 text += page.get_text()
         return text
-    except Exception as e:
+    except Exception:
         return ""
 
 # --- Chunking & Semantic Search ---
@@ -153,16 +153,26 @@ def ask():
     if not relevant_chunks:
         return jsonify({"answer": "I cannot answer this question as the information is not in the provided documents."})
 
-    context = "\n\n".join([
-        f"FROM [{chunk['source']}]({chunk['link']}):\n{chunk['text']}"
-        for chunk in relevant_chunks
-    ])
+    context = "\n\n".join([f"FROM {chunk['source']} ({chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
     prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"
 
     try:
         gemini_response = model.generate_content(prompt)
         answer = getattr(gemini_response, "text", "Oops, no answer returned.")
+
+        # Add clean "Sources" section with links
+        unique_sources = {}
+        for chunk in relevant_chunks:
+            if chunk["link"] not in unique_sources:
+                unique_sources[chunk["link"]] = chunk["source"]
+
+        if unique_sources:
+            answer += "\n\n---\n**Sources:**\n"
+            for link, name in unique_sources.items():
+                answer += f"- [{name}]({link})\n"
+
         return jsonify({"answer": answer})
+
     except Exception as e:
         return jsonify({"answer": f"Server error: {str(e)}"}), 500
 
