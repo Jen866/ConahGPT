@@ -1,51 +1,40 @@
-async function sendMessage() {
-    const inputElement = document.getElementById("user-input");
-    const chatBox = document.getElementById("chat-box");
-    const userText = inputElement.value.trim();
+document.addEventListener("DOMContentLoaded", function () {
+  const form = document.getElementById("question-form");
+  const input = document.getElementById("question");
+  const messages = document.getElementById("messages");
 
-    // Stop if the input is empty
-    if (!userText) {
-        return;
-    }
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const question = input.value.trim();
+    if (!question) return;
 
-    // Display the user's question immediately
-    chatBox.innerHTML += `<div><strong>You:</strong> ${userText}</div>`;
-    inputElement.value = ""; // Clear the input box
+    appendMessage("You", question);
+    input.value = "";
 
     try {
-        // Send the question to the Python backend
-        const response = await fetch('/ask', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            // This correctly formats the question in JSON
-            body: JSON.stringify({ question: userText })
-        });
+      const response = await fetch("/ask", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ question }),
+      });
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! Status: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        // Display the answer or an error from the backend
-        let botResponse = "";
-        if (data.answer) {
-            // This replaces newline characters from the AI with <br> tags for HTML
-            const formattedAnswer = data.answer.replace(/\n/g, '<br>');
-            botResponse = `<div><strong>Conah GPT:</strong> ${formattedAnswer}</div>`;
-        } else {
-            botResponse = `<div><strong style="color: red;">Error:</strong> ${data.error || 'No answer returned.'}</div>`;
-        }
-        chatBox.innerHTML += botResponse;
-
+      const data = await response.json();
+      if (data.answer) {
+        appendMessage("Conah GPT", marked.parse(data.answer));
+      } else {
+        appendMessage("Conah GPT", "Sorry, no response received.");
+      }
     } catch (error) {
-        // Handle network errors
-        console.error("Fetch Error:", error);
-        chatBox.innerHTML += `<div><strong style="color: red;">Error:</strong> Could not connect to the server.</div>`;
+      appendMessage("Conah GPT", "Something went wrong. Please try again.");
     }
+  });
 
-    // Scroll to the bottom of the chat box
-    chatBox.scrollTop = chatBox.scrollHeight;
-}
+  function appendMessage(sender, text) {
+    const message = document.createElement("div");
+    message.innerHTML = `<strong>${sender}:</strong> ${text}`;
+    messages.appendChild(message);
+    messages.scrollTop = messages.scrollHeight;
+  }
+});
