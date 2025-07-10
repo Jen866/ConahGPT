@@ -51,10 +51,16 @@ button {
 
 /* This rule removes the line from the very last message for a cleaner look */
 .chat-box div:last-child {
-    border-bottom: none;
+  border-bottom: none;
 }
 
 .chat-box strong {
   color: #000;
 }
 
+/* ✅ NEW: Make markdown links inside the chat blue and clickable */
+.chat-box a {
+  color: #0645AD;
+  text-decoration: underline;
+  word-break: break-all;
+}
