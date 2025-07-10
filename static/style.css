@@ -1,0 +1,66 @@
+body {
+  font-family: Arial, sans-serif;
+  background: #fdfaf5;
+  text-align: center;
+  margin-top: 40px;
+}
+
+h1 {
+  font-weight: normal;
+}
+
+textarea {
+  display: block;
+  width: 80%;
+  max-width: 500px;
+  height: 80px;
+  padding: 12px;
+  font-size: 1rem;
+  margin: 0 auto 10px auto; /* This centers the text area */
+  border-radius: 6px;
+  border: 1px solid #ccc;
+  resize: vertical;
+}
+
+button {
+  background-color: #b48b49;
+  color: white;
+  padding: 10px 24px;
+  border: none;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+/* This positions the entire chat box to the left */
+.chat-box {
+  margin-top: 30px;
+  margin-left: 80px;  /* Pushes the box off the far-left edge. You can change this value. */
+  max-width: 700px;
+  text-align: left;
+  font-size: 1.05rem;
+}
+
+/* This styles each individual message and adds the separator line */
+.chat-box div {
+  line-height: 1.5;
+  padding-bottom: 15px; /* Adds space between the text and the line */
+  margin-bottom: 15px;  /* Adds space between the line and the next message */
+  border-bottom: 1px solid #e0e0e0; /* This is the separator line */
+}
+
+/* This rule removes the line from the very last message for a cleaner look */
+.chat-box div:last-child {
+  border-bottom: none;
+}
+
+.chat-box strong {
+  color: #000;
+}
+
+/* ✅ NEW: Make markdown links inside the chat blue and clickable */
+.chat-box a {
+  color: #0645AD;
+  text-decoration: underline;
+  word-break: break-all;
+}
