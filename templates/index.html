@@ -4,26 +4,73 @@
     <meta charset="UTF-8">
     <title>Conah GPT</title>
     <link rel="stylesheet" href="/static/style.css">
+    <style>
+        body {
+            background-color: #fef8ef;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+        }
+        textarea {
+            width: 100%;
+            padding: 10px;
+            font-size: 16px;
+        }
+        button {
+            margin-top: 10px;
+            background-color: #bc8b4b;
+            color: white;
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            cursor: pointer;
+            border-radius: 8px;
+        }
+        .chat-entry {
+            margin-top: 20px;
+        }
+        a {
+            color: #1a0dab;
+            text-decoration: underline;
+        }
+    </style>
 </head>
-<body style="background-color: #fef8ef; font-family: Arial, sans-serif;">
+<body>
+    <div class="container">
+        <h1 style="text-align: center;">ACTUARY CONSULTING</h1>
 
-    <div style="max-width: 800px; margin: 40px auto; padding: 20px;">
-        <h1 style="text-align: center; color: #000;">ACTUARY CONSULTING</h1>
+        <textarea id="question" rows="4" placeholder="Ask Conah GPT..."></textarea>
+        <button onclick="sendQuestion()">Send</button>
 
-        <div style="margin-top: 40px;">
-            <textarea id="question" rows="4" style="width: 100%; padding: 10px; font-size: 16px;" placeholder="Ask Conah GPT..."></textarea>
-            <button onclick="sendQuestion()" style="margin-top: 10px; background-color: #bc8b4b; color: white; padding: 10px 20px; font-size: 16px; border: none; cursor: pointer; border-radius: 8px;">Send</button>
-        </div>
-
-        <div id="chat" style="margin-top: 40px;">
-            {% for msg in messages %}
-                <p><strong>You:</strong> {{ msg.question }}</p>
-                <p><strong>Conah GPT:</strong> <span>{{ msg.answer | safe }}</span></p>
-                <hr>
-            {% endfor %}
-        </div>
+        <div id="chat" class="chat-entry"></div>
     </div>
 
-    <script src="/static/script.js"></script>
+    <script>
+        async function sendQuestion() {
+            const question = document.getElementById("question").value.trim();
+            if (!question) return;
+
+            const chat = document.getElementById("chat");
+            const userMessage = `<p><strong>You:</strong> ${question}</p>`;
+            chat.innerHTML += userMessage;
+
+            const response = await fetch("/ask", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ question: question })
+            });
+
+            const data = await response.json();
+            const botMessage = `<p><strong>Conah GPT:</strong> ${data.answer}</p><hr>`;
+            chat.innerHTML += botMessage;
+
+            document.getElementById("question").value = "";
+        }
+    </script>
 </body>
 </html>
