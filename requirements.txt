@@ -8,3 +8,6 @@ PyMuPDF
 oauth2client
 scikit-learn
 gunicorn
+google-auth-oauthlib
+google-generativeai
+markdown
