@@ -33,7 +33,7 @@ drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
 # --- Gemini Setup ---
-genai.configure(api_key="AIzaSyAbLRMFiD5GfK4kWqV3ndnki0_VN6iGIYE")  # Replace with your key
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
@@ -43,6 +43,10 @@ model = genai.GenerativeModel(
     Always cite the source files used, with a clickable link.
     """
 )
+
+# --- Utility for PDFs ---
+def clean_pdf_text(text):
+    return re.sub(r'\s+', ' ', text).strip()
 
 # --- File Readers ---
 def list_all_files_in_shared_drive(shared_drive_id):
@@ -88,7 +92,7 @@ def read_pdf(file_id):
         with fitz.open(stream=fh, filetype="pdf") as pdf_doc:
             for page in pdf_doc:
                 text += page.get_text()
-        return text
+        return clean_pdf_text(text)
     except:
         return ""
 
@@ -125,7 +129,7 @@ def get_relevant_chunks(question, chunks, top_k=5):
     question_vector = vectorizer.transform([question])
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     top_indices = similarities.argsort()[-top_k:][::-1]
-    return [chunks[i] for i in top_indices if similarities[i] > 0.1]
+    return [chunks[i] for i in top_indices if similarities[i] > 0.05]
 
 # --- Convert Markdown to HTML ---
 def convert_md_links_to_html(text):
