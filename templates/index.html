@@ -1,23 +1,37 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8">
   <title>Conah GPT</title>
-  <link rel="stylesheet" href="/static/style.css" />
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <div class="container">
-    <h1 style="text-align: center;">ACTUARY CONSULTING</h1>
-
-    <form id="question-form">
-      <textarea id="question" rows="4" placeholder="Ask Conah GPT..."></textarea>
-      <button type="submit">Send</button>
-    </form>
-
-    <div id="messages" class="chat-box"></div>
+    <h1>ACTUARY CONSULTING</h1>
+    <textarea id="question" placeholder="Ask Conah GPT..." rows="4"></textarea>
+    <button onclick="sendQuestion()">Send</button>
+    <div id="chat"></div>
   </div>
 
-  <script src="/static/script.js"></script>
+  <script>
+    async function sendQuestion() {
+      const question = document.getElementById("question").value.trim();
+      if (!question) return;
+
+      const chat = document.getElementById("chat");
+      chat.innerHTML += `<p><strong>You:</strong> ${question}</p>`;
+
+      const response = await fetch("/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: question })
+      });
+
+      const data = await response.json();
+      chat.innerHTML += `<p><strong>Conah GPT:</strong><br>${marked.parse(data.answer)}</p><hr>`;
+      document.getElementById("question").value = "";
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </body>
 </html>
