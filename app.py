@@ -1,123 +1,136 @@
+import os
+import json
+import markdown
 from flask import Flask, request, jsonify, render_template
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from PyPDF2 import PdfReader
-import os
-import io
-import docx
 import google.generativeai as genai
 
 app = Flask(__name__)
 
-# === CONFIGURATION ===
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-SERVICE_ACCOUNT_FILE = 'conah-gpt-service-key.json'  # <-- change this if your file has a different name
-FOLDER_ID = '10ZMJ54LvgXBZDe5PdFmcqUzt06KrMJyl'
-
-creds = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES
-)
-drive_service = build('drive', 'v3', credentials=creds)
-docs_service = build('docs', 'v1', credentials=creds)
-sheets_service = build('sheets', 'v4', credentials=creds)
-
+# Set up Gemini API key from environment
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('models/gemini-1.5-pro-latest')
 
-# === HELPERS ===
-def get_file_list():
-    results = drive_service.files().list(
-        q=f"'{FOLDER_ID}' in parents and trashed = false",
-        pageSize=1000,
-        fields="files(id, name, mimeType)"
-    ).execute()
-    return results.get('files', [])
+# Load service account credentials from environment
+SERVICE_ACCOUNT_INFO = json.loads(os.environ.get("SERVICE_ACCOUNT_JSON"))
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+creds = service_account.Credentials.from_service_account_info(
+    SERVICE_ACCOUNT_INFO, scopes=SCOPES
+)
 
+# Gemini model
+model = genai.GenerativeModel("models/gemini-1.5-pro-latest")
+
+# Google Drive folder to pull context from
+FOLDER_ID = "10ZMJ54LvgXBZDe5PdFmcqUzt06KrMJyl"
+
+# Utility: Load Google Drive files
+def get_files_from_folder(folder_id):
+    drive_service = build("drive", "v3", credentials=creds)
+    query = f"'{folder_id}' in parents and trashed = false"
+    response = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
+    return response.get("files", [])
+
+# Utility: Extract content from Google Docs
 def extract_text_from_google_doc(file_id):
+    docs_service = build("docs", "v1", credentials=creds)
     doc = docs_service.documents().get(documentId=file_id).execute()
+    body = doc.get("body", {}).get("content", [])
     text = ""
-    for content in doc.get("body", {}).get("content", []):
-        paragraph = content.get("paragraph")
-        if paragraph:
-            for element in paragraph.get("elements", []):
-                text += element.get("textRun", {}).get("content", "")
+    for content in body:
+        if "paragraph" in content:
+            elements = content["paragraph"].get("elements", [])
+            for elem in elements:
+                text += elem.get("textRun", {}).get("content", "")
     return text.strip()
 
+# Utility: Extract content from Google Sheets
 def extract_text_from_google_sheet(file_id):
-    result = sheets_service.spreadsheets().values().get(
-        spreadsheetId=file_id, range="A1:Z1000").execute()
-    rows = result.get('values', [])
-    return "\n".join([", ".join(row) for row in rows])
+    sheets_service = build("sheets", "v4", credentials=creds)
+    sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
+    sheet_names = [s["properties"]["title"] for s in sheet_metadata["sheets"]]
 
+    all_text = ""
+    for name in sheet_names:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=file_id, range=name
+        ).execute()
+        values = result.get("values", [])
+        for row in values:
+            all_text += " | ".join(row) + "\n"
+    return all_text.strip()
+
+# Utility: Extract content from PDFs
 def extract_text_from_pdf(file_id):
-    file = drive_service.files().get_media(fileId=file_id).execute()
-    reader = PdfReader(io.BytesIO(file))
-    return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
+    from io import BytesIO
+    from PyPDF2 import PdfReader
 
-def extract_text_from_docx(file_id):
-    file = drive_service.files().get_media(fileId=file_id).execute()
-    doc = docx.Document(io.BytesIO(file))
-    return "\n".join([para.text for para in doc.paragraphs])
+    drive_service = build("drive", "v3", credentials=creds)
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = BytesIO()
+    downloader = request.execute()
+    fh.write(downloader)
+    fh.seek(0)
+    reader = PdfReader(fh)
 
-def get_gdrive_file_link(file_id):
-    return f"https://drive.google.com/file/d/{file_id}/view"
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text.strip()
 
-# === MAIN LOGIC ===
-@app.route('/')
+# Route: Web interface
+@app.route("/")
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
-@app.route('/ask', methods=['POST'])
+# Route: Ask Conah GPT
+@app.route("/ask", methods=["POST"])
 def ask():
-    data = request.get_json()
-    user_question = data.get('question', '')
+    user_question = request.json.get("question", "")
+    if not user_question:
+        return jsonify({"answer": "Please provide a question."})
 
-    files = get_file_list()
-    contexts = []
-    used_sources = set()
+    files = get_files_from_folder(FOLDER_ID)
 
-    for f in files:
+    context_blocks = []
+    sources = set()  # Avoid duplicates
+
+    for file in files:
+        file_id = file["id"]
+        name = file["name"]
+        mime_type = file["mimeType"]
+
         try:
-            if f['mimeType'] == 'application/vnd.google-apps.document':
-                content = extract_text_from_google_doc(f['id'])
-            elif f['mimeType'] == 'application/vnd.google-apps.spreadsheet':
-                content = extract_text_from_google_sheet(f['id'])
-            elif f['mimeType'] == 'application/pdf':
-                content = extract_text_from_pdf(f['id'])
-            elif f['mimeType'] == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                content = extract_text_from_docx(f['id'])
+            if "document" in mime_type:
+                content = extract_text_from_google_doc(file_id)
+            elif "spreadsheet" in mime_type:
+                content = extract_text_from_google_sheet(file_id)
+            elif "pdf" in mime_type or name.lower().endswith(".pdf"):
+                content = extract_text_from_pdf(file_id)
             else:
                 continue
 
-            file_link = get_gdrive_file_link(f['id'])
-            if file_link in used_sources:
-                continue  # avoid repeating the same source
-            used_sources.add(file_link)
+            doc_link = f"https://drive.google.com/file/d/{file_id}/view"
+            context_blocks.append(f"From {name}:\n{content}")
+            sources.add(f"[{name}]({doc_link})")
 
-            contexts.append(f"Source: {f['name']} ({file_link})\n{content}")
         except Exception as e:
-            print(f"Error reading {f['name']}: {e}")
+            print(f"Failed to read {name}: {e}")
 
-    prompt = f"""You are Conah GPT, an expert assistant trained on actuarial, legal, and consulting documents. 
-Answer the question below using only the context provided from internal company files. Be concise and factual. 
-If unsure, say "I'm not sure based on the available files."
+    prompt = (
+        f"You are Conah GPT, a helpful assistant for actuaries.\n\n"
+        f"User Question: {user_question}\n\n"
+        f"Context:\n{chr(10).join(context_blocks)}"
+    )
 
-Question: {user_question}
+    try:
+        response = model.generate_content(prompt)
+        answer = response.text
+        if sources:
+            answer += "\n\n**Sources:**\n" + "\n".join(f"- {s}" for s in sources)
+        return jsonify({"answer": markdown.markdown(answer)})
+    except Exception as e:
+        return jsonify({"answer": f"Error generating response: {str(e)}"})
 
----CONTEXT---
-{chr(10).join(contexts[:5])}
-"""
-
-    response = model.generate_content(prompt)
-    answer = response.text
-
-    # Extract source links from prompt (top 5 only) and include just once
-    source_links = [get_gdrive_file_link(f['id']) for f in files[:5]]
-    unique_links = list(dict.fromkeys(source_links))  # remove duplicates while preserving order
-    sources_md = "\n".join([f"- [{f['name']}]({get_gdrive_file_link(f['id'])})" for f in files[:5]])
-
-    return jsonify({"answer": f"{answer}\n\n**Sources:**\n{sources_md}"})
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
