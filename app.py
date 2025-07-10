@@ -1,101 +1,174 @@
 import os
+import io
+import fitz  # PyMuPDF
+import gspread
 import json
-import google.auth
+import re
 import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template
-from google.oauth2 import service_account
+from flask_cors import CORS
+from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 
+# --- Flask Setup ---
 app = Flask(__name__)
+CORS(app)
 
-# Load Gemini API key
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# --- Google Auth Setup ---
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents.readonly"
+]
 
-# Load Google credentials
-SERVICE_ACCOUNT_INFO = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
-creds = service_account.Credentials.from_service_account_info(
-    SERVICE_ACCOUNT_INFO,
-    scopes=["https://www.googleapis.com/auth/drive.readonly"]
+SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
+creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SERVICE_ACCOUNT_JSON), SCOPES)
+gspread_client = gspread.authorize(creds)
+drive_service = build('drive', 'v3', credentials=creds)
+docs_service = build('docs', 'v1', credentials=creds)
+
+# --- Gemini Setup ---
+genai.configure(api_key="AIzaSyAbLRMFiD5GfK4kWqV3ndnki0_VN6iGIYE")  # Replace with your key
+model = genai.GenerativeModel(
+    model_name="models/gemini-1.5-pro",
+    system_instruction="""
+    You are Conah GPT, an expert business assistant for Actuary Consulting.
+    You answer questions based on the CONTEXT provided. Interpret the meaning — don’t require exact matches.
+    If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
+    Always cite the source files used, with a clickable link.
+    """
 )
-drive_service = build("drive", "v3", credentials=creds)
-docs_service = build("docs", "v1", credentials=creds)
 
-# Folder ID where your files are stored
-FOLDER_ID = "10ZMJ54LvgXBZDe5PdFmcqUzt06KrMJyl"
+# --- File Readers ---
+def list_all_files_in_shared_drive(shared_drive_id):
+    results = drive_service.files().list(
+        q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
+        corpora="drive",
+        driveId=shared_drive_id,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        fields="files(id, name, mimeType)"
+    ).execute()
+    return results.get('files', [])
 
-def extract_google_doc_content(file_id):
-    doc = docs_service.documents().get(documentId=file_id).execute()
-    body = doc.get("body", {}).get("content", [])
-    text = ""
-    for value in body:
-        if "paragraph" in value:
-            elements = value["paragraph"].get("elements", [])
-            for elem in elements:
-                if "textRun" in elem:
-                    text += elem["textRun"].get("content", "")
-    return text
+def read_google_sheet(file_id):
+    try:
+        sheet = gspread_client.open_by_key(file_id).sheet1
+        return "\n".join([str(row) for row in sheet.get_all_records()])
+    except:
+        return ""
 
-def extract_pdf_content(file_id):
-    return "[PDF content not supported in this version]"
+def read_google_doc(file_id):
+    try:
+        doc = docs_service.documents().get(documentId=file_id).execute()
+        text = ""
+        for content_item in doc.get("body", {}).get("content", []):
+            if "paragraph" in content_item:
+                for element in content_item["paragraph"].get("elements", []):
+                    text += element.get("textRun", {}).get("content", "")
+        return text
+    except:
+        return ""
 
-def get_files_from_drive():
-    query = f"'{FOLDER_ID}' in parents and trashed = false"
-    response = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
-    return response.get("files", [])
+def read_pdf(file_id):
+    try:
+        request_file = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request_file)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        text = ""
+        with fitz.open(stream=fh, filetype="pdf") as pdf_doc:
+            for page in pdf_doc:
+                text += page.get_text()
+        return text
+    except:
+        return ""
 
-def build_prompt(question, file_data):
-    context = "\n\n".join(
-        f"---\nFilename: {f['name']}\n\n{f['content']}" for f in file_data if f["content"]
-    )
-    return f"""You are Conah GPT, a helpful assistant answering questions using ACTUARY CONSULTING documents. 
-Answer the question below using only the context provided. 
-If the answer is not in the documents, say so.
+# --- Chunking & Search ---
+def chunk_text(text, chunk_size=300):
+    words = text.split()
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-Context:
-{context}
+def extract_all_chunks(shared_drive_id):
+    files = list_all_files_in_shared_drive(shared_drive_id)
+    chunks = []
+    for file in files:
+        file_id, name, mime_type = file['id'], file['name'], file['mimeType']
+        doc_link = f"https://drive.google.com/file/d/{file_id}"
+        content = ""
+        if mime_type == 'application/vnd.google-apps.spreadsheet':
+            content = read_google_sheet(file_id)
+        elif mime_type == 'application/vnd.google-apps.document':
+            content = read_google_doc(file_id)
+        elif mime_type == 'application/pdf':
+            content = read_pdf(file_id)
+        if not content.strip():
+            continue
+        for chunk in chunk_text(content):
+            chunks.append({"text": chunk, "source": name, "link": doc_link})
+    return chunks
 
-Question: {question}
-Answer:"""
+def get_relevant_chunks(question, chunks, top_k=5):
+    if not chunks:
+        return []
+    documents = [chunk["text"] for chunk in chunks]
+    vectorizer = TfidfVectorizer().fit(documents + [question])
+    doc_vectors = vectorizer.transform(documents)
+    question_vector = vectorizer.transform([question])
+    similarities = cosine_similarity(question_vector, doc_vectors).flatten()
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return [chunks[i] for i in top_indices if similarities[i] > 0.1]
 
+# --- Convert Markdown to HTML ---
+def convert_md_links_to_html(text):
+    return re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank">\1</a>', text)
+
+# --- Routes ---
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    data = request.get_json()
-    question = data.get("question", "")
-    files = get_files_from_drive()
+    data = request.get_json(force=True, silent=True) or {}
+    question = data.get("question", "").strip()
 
-    file_data = []
-    sources = []
+    if not question:
+        return jsonify({"answer": "Please enter a question."}), 400
 
-    for file in files:
-        file_id = file["id"]
-        file_name = file["name"]
-        link = f"https://docs.google.com/document/d/{file_id}/edit"
+    if question.lower() in ["hi", "hello", "hey", "how are you", "what's up"]:
+        return jsonify({"answer": "Hi there! 😊 How can I help you today with anything actuarial or business-related?"})
 
-        if file["mimeType"] == "application/vnd.google-apps.document":
-            content = extract_google_doc_content(file_id)
-            file_data.append({"name": file_name, "content": content, "link": link})
-        elif file["mimeType"] == "application/pdf":
-            content = extract_pdf_content(file_id)
-            file_data.append({"name": file_name, "content": content, "link": link})
+    shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
+    chunks = extract_all_chunks(shared_drive_id)
 
-    prompt = build_prompt(question, file_data)
+    if not chunks:
+        return jsonify({"answer": "I couldn’t read any usable files from Google Drive. Please double check that your folder contains readable Google Docs, Sheets, or PDFs."})
 
-    model = genai.GenerativeModel("models/gemini-1.5-pro-latest")
-    response = model.generate_content(prompt)
+    relevant_chunks = get_relevant_chunks(question, chunks)
+    if not relevant_chunks:
+        return jsonify({"answer": "I cannot answer this question as the information is not in the provided documents."})
 
-    answer_text = response.text
+    context = "\n\n".join([f"FROM {chunk['source']} ({chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
+    prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"
 
-    # Add single link to first matching document as source
-    for f in file_data:
-        if f["name"].lower() in answer_text.lower() or any(word in answer_text.lower() for word in f["content"].lower().split()[:50]):
-            answer_text += f"\n\n[Source]({f['link']})"
-            break
+    try:
+        gemini_response = model.generate_content(prompt)
+        raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
+        answer = convert_md_links_to_html(raw_answer)
+        return jsonify({"answer": answer})
+    except Exception as e:
+        return jsonify({"answer": f"Server error: {str(e)}"}), 500
 
-    return jsonify({"answer": answer_text})
-
+# --- Run Server ---
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
