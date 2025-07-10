@@ -16,6 +16,7 @@ import numpy as np
 app = Flask(__name__)
 CORS(app)
 
+# --- Google Auth Setup ---
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://spreadsheets.google.com/feeds",
@@ -29,17 +30,19 @@ gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# --- Gemini Setup ---
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
     You are Conah GPT, an expert business assistant for Actuary Consulting.
     You answer questions based on the CONTEXT provided. Interpret the meaning — don’t require exact matches.
     If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
-    Always cite the source files used, with a clickable link.
+    Always cite the source files used, with a clickable link to the exact paragraph in the source (if available).
     """
 )
 
+# --- File Readers ---
 def list_all_files_in_shared_drive(shared_drive_id):
     results = drive_service.files().list(
         q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
@@ -61,21 +64,19 @@ def read_google_sheet(file_id):
 def read_google_doc(file_id):
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
-        body = doc.get("body", {}).get("content", [])
-        doc_chunks = []
-        for block in body:
-            if "paragraph" in block:
-                para_text = ""
-                elements = block["paragraph"].get("elements", [])
-                for el in elements:
-                    para_text += el.get("textRun", {}).get("content", "")
-                para_id = block.get("paragraph", {}).get("paragraphStyle", {}).get("namedStyleType") or ""
-                object_id = block.get("paragraph", {}).get("elementId") or ""
-                doc_chunks.append({
-                    "text": para_text.strip(),
-                    "paragraph_id": object_id or para_id
-                })
-        return doc_chunks
+        content = doc.get("body", {}).get("content", [])
+        paragraphs = []
+        for idx, element in enumerate(content):
+            if "paragraph" in element:
+                text_run = ""
+                for e in element["paragraph"].get("elements", []):
+                    text_run += e.get("textRun", {}).get("content", "")
+                if text_run.strip():
+                    para_id = element.get("paragraph", {}).get("paragraphStyle", {}).get("namedStyleType", "")
+                    heading = f"#heading={para_id}" if para_id.startswith("HEADING") else "#heading=NORMAL_TEXT"
+                    link = f"https://docs.google.com/document/d/{file_id}/edit{heading}"
+                    paragraphs.append({"text": text_run.strip(), "source": doc.get("title", "Google Doc"), "link": link})
+        return paragraphs
     except:
         return []
 
@@ -92,10 +93,14 @@ def read_pdf(file_id):
         with fitz.open(stream=fh, filetype="pdf") as pdf_doc:
             for page in pdf_doc:
                 text += page.get_text()
-        return text
+        if text.strip():
+            return [{"text": text, "source": "PDF Document", "link": f"https://drive.google.com/file/d/{file_id}"}]
+        else:
+            return []
     except:
-        return ""
+        return []
 
+# --- Chunking & Embedding ---
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
@@ -105,26 +110,16 @@ def extract_all_chunks(shared_drive_id):
     chunks = []
     for file in files:
         file_id, name, mime_type = file['id'], file['name'], file['mimeType']
-        base_link = f"https://drive.google.com/file/d/{file_id}"
-
-        if mime_type == 'application/vnd.google-apps.document':
-            doc_chunks = read_google_doc(file_id)
-            for para in doc_chunks:
-                para_text = para['text']
-                pid = para.get('paragraph_id')
-                link = f"{base_link}/edit#heading={pid}" if pid else base_link
-                if para_text:
-                    chunks.append({"text": para_text, "source": name, "link": link})
-
-        elif mime_type == 'application/vnd.google-apps.spreadsheet':
+        if mime_type == 'application/vnd.google-apps.spreadsheet':
             content = read_google_sheet(file_id)
-            for chunk in chunk_text(content):
-                chunks.append({"text": chunk, "source": name, "link": base_link})
-
+            if content.strip():
+                for chunk in chunk_text(content):
+                    chunks.append({"text": chunk, "source": name, "link": f"https://docs.google.com/spreadsheets/d/{file_id}"})
+        elif mime_type == 'application/vnd.google-apps.document':
+            paragraphs = read_google_doc(file_id)
+            chunks.extend(paragraphs)
         elif mime_type == 'application/pdf':
-            content = read_pdf(file_id)
-            for chunk in chunk_text(content):
-                chunks.append({"text": chunk, "source": name, "link": base_link})
+            chunks.extend(read_pdf(file_id))
     return chunks
 
 def get_relevant_chunks(question, chunks, top_k=5):
@@ -138,6 +133,7 @@ def get_relevant_chunks(question, chunks, top_k=5):
     top_indices = similarities.argsort()[-top_k:][::-1]
     return [chunks[i] for i in top_indices if similarities[i] > 0.1]
 
+# --- Routes ---
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -169,12 +165,16 @@ def ask():
     try:
         gemini_response = model.generate_content(prompt)
         answer = getattr(gemini_response, "text", "Oops, no answer returned.")
-        sources = "\n".join([f"- [{chunk['source']}]({chunk['link']})" for chunk in relevant_chunks])
-        full_response = f"{answer}\n\n---\n**Sources:**\n{sources}"
-        return jsonify({"answer": full_response})
+
+        # Add sources below the answer
+        sources = "\n\n**Sources:**\n" + "\n".join(
+            [f"- [{chunk['source']}]({chunk['link']})" for chunk in relevant_chunks]
+        )
+        return jsonify({"answer": answer + sources})
     except Exception as e:
         return jsonify({"answer": f"Server error: {str(e)}"}), 500
 
+# --- Run ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
