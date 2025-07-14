@@ -9,3 +9,5 @@ google-generativeai
 PyMuPDF
 scikit-learn
 gunicorn
+slack_bolt
+slack_sdk
