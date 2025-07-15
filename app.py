@@ -7,12 +7,13 @@ import re
 import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
 
 # --- Flask Setup ---
 app = Flask(__name__)
@@ -43,6 +44,10 @@ model = genai.GenerativeModel(
     Always cite the source files used, with a clickable link.
     """
 )
+
+# --- Slack Setup ---
+slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
+slack_client = WebClient(token=slack_bot_token)
 
 # --- Utility for PDFs ---
 def clean_pdf_text(text):
@@ -131,11 +136,10 @@ def get_relevant_chunks(question, chunks, top_k=5):
     top_indices = similarities.argsort()[-top_k:][::-1]
     return [chunks[i] for i in top_indices if similarities[i] > 0.05]
 
-# --- Convert Markdown to HTML ---
 def convert_md_links_to_html(text):
     return re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank">\1</a>', text)
 
-# --- Routes ---
+# --- Web UI Route ---
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -171,6 +175,43 @@ def ask():
         return jsonify({"answer": answer})
     except Exception as e:
         return jsonify({"answer": f"Server error: {str(e)}"}), 500
+
+# --- Slack Event Route ---
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    data = request.get_json()
+
+    if data.get("type") == "url_verification":
+        return jsonify({"challenge": data["challenge"]})
+
+    if "event" in data and data["event"].get("type") == "app_mention":
+        event = data["event"]
+        user_question = event.get("text", "").split(" ", 1)[-1]
+        channel_id = event.get("channel")
+
+        # Use internal logic
+        shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
+        chunks = extract_all_chunks(shared_drive_id)
+        relevant_chunks = get_relevant_chunks(user_question, chunks)
+
+        if not relevant_chunks:
+            reply = "I cannot answer this question as the information is not in the provided documents."
+        else:
+            context = "\n\n".join([f"FROM {chunk['source']} ({chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
+            prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{user_question}"
+            try:
+                gemini_response = model.generate_content(prompt)
+                raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
+                reply = convert_md_links_to_html(raw_answer)
+            except Exception as e:
+                reply = f"Error generating response: {str(e)}"
+
+        try:
+            slack_client.chat_postMessage(channel=channel_id, text=reply)
+        except SlackApiError as e:
+            print(f"Slack API Error: {e.response['error']}")
+
+    return "OK", 200
 
 # --- Run Server ---
 if __name__ == "__main__":
