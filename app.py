@@ -136,6 +136,12 @@ def get_relevant_chunks(question, chunks, top_k=5):
     top_indices = similarities.argsort()[-top_k:][::-1]
     return [chunks[i] for i in top_indices if similarities[i] > 0.05]
 
+# --- Preload chunks on startup ---
+print("🔄 Preloading Google Drive data...")
+SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
+PRELOADED_CHUNKS = extract_all_chunks(SHARED_DRIVE_ID)
+print(f"✅ Loaded {len(PRELOADED_CHUNKS)} chunks from Google Drive.")
+
 # --- Slack Route ---
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -148,8 +154,7 @@ def slack_events():
         channel_id = data["event"].get("channel", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
-        shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
-        chunks = extract_all_chunks(shared_drive_id)
+        chunks = PRELOADED_CHUNKS
 
         if not chunks:
             reply = "I couldn’t read any usable files from Google Drive. Please check the folder."
