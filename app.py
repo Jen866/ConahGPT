@@ -76,13 +76,19 @@ def read_google_doc(file_id):
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         text = ""
+        paragraph_count = 0
+        chunks = []
         for content_item in doc.get("body", {}).get("content", []):
             if "paragraph" in content_item:
+                paragraph_count += 1
+                paragraph_text = ""
                 for element in content_item["paragraph"].get("elements", []):
-                    text += element.get("textRun", {}).get("content", "")
-        return text
+                    paragraph_text += element.get("textRun", {}).get("content", "")
+                if paragraph_text.strip():
+                    chunks.append({"text": paragraph_text.strip(), "location": f"paragraph {paragraph_count}"})
+        return chunks
     except:
-        return ""
+        return []
 
 def read_pdf(file_id):
     try:
@@ -93,15 +99,26 @@ def read_pdf(file_id):
         while not done:
             _, done = downloader.next_chunk()
         fh.seek(0)
-        text = ""
+        chunks = []
         with fitz.open(stream=fh, filetype="pdf") as pdf_doc:
-            for page in pdf_doc:
-                text += page.get_text()
-        return clean_pdf_text(text)
+            for page_num, page in enumerate(pdf_doc, start=1):
+                text = clean_pdf_text(page.get_text())
+                if text:
+                    chunks.append({"text": text, "location": f"page {page_num}"})
+        return chunks
     except:
-        return ""
+        return []
 
 # --- Chunking & Search ---
+def chunk_text_with_location(content, source, link):
+    result = []
+    for item in content:
+        text = item["text"]
+        location = item.get("location", "")
+        for chunk in chunk_text(text):
+            result.append({"text": chunk, "source": source, "link": link, "location": location})
+    return result
+
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
@@ -112,17 +129,17 @@ def extract_all_chunks(shared_drive_id):
     for file in files:
         file_id, name, mime_type = file['id'], file['name'], file['mimeType']
         doc_link = f"https://drive.google.com/file/d/{file_id}"
-        content = ""
+        content = []
         if mime_type == 'application/vnd.google-apps.spreadsheet':
-            content = read_google_sheet(file_id)
+            text = read_google_sheet(file_id)
+            content = [{"text": text, "location": ""}] if text else []
         elif mime_type == 'application/vnd.google-apps.document':
             content = read_google_doc(file_id)
         elif mime_type == 'application/pdf':
             content = read_pdf(file_id)
-        if not content.strip():
+        if not content:
             continue
-        for chunk in chunk_text(content):
-            chunks.append({"text": chunk, "source": name, "link": doc_link})
+        chunks.extend(chunk_text_with_location(content, name, doc_link))
     return chunks
 
 def get_relevant_chunks(question, chunks, top_k=5):
@@ -136,12 +153,6 @@ def get_relevant_chunks(question, chunks, top_k=5):
     top_indices = similarities.argsort()[-top_k:][::-1]
     return [chunks[i] for i in top_indices if similarities[i] > 0.05]
 
-# --- Preload chunks on startup ---
-print("🔄 Preloading Google Drive data...")
-SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
-PRELOADED_CHUNKS = extract_all_chunks(SHARED_DRIVE_ID)
-print(f"✅ Loaded {len(PRELOADED_CHUNKS)} chunks from Google Drive.")
-
 # --- Slack Route ---
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -154,7 +165,8 @@ def slack_events():
         channel_id = data["event"].get("channel", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
-        chunks = PRELOADED_CHUNKS
+        shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
+        chunks = extract_all_chunks(shared_drive_id)
 
         if not chunks:
             reply = "I couldn’t read any usable files from Google Drive. Please check the folder."
@@ -163,7 +175,10 @@ def slack_events():
             if not relevant_chunks:
                 reply = "I cannot answer this question as the information is not in the provided documents."
             else:
-                context = "\n\n".join([f"FROM {chunk['source']} ({chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
+                context = "\n\n".join([
+                    f"FROM {chunk['source']} ({chunk['link']}){f', {chunk['location']}' if chunk['location'] else ''}:\n{chunk['text']}"
+                    for chunk in relevant_chunks
+                ])
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
                 try:
                     gemini_response = model.generate_content(prompt)
