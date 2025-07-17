@@ -143,6 +143,9 @@ def get_relevant_chunks(question, chunks, top_k=5):
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
+    if request.headers.get("X-Slack-Retry-Num"):
+        return Response(), 200
+
     data = request.json
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
@@ -178,7 +181,7 @@ def slack_events():
 
 @app.route("/")
 def index():
-    return "✅ ConahGPT Slack bot with PDF+Doc refs is running."
+    return "✅ ConahGPT Slack bot with PDF+Doc refs and single response is running."
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
