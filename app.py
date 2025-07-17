@@ -84,12 +84,11 @@ def read_google_doc(file_id):
                 for element in content_item["paragraph"].get("elements", []):
                     paragraph_text += element.get("textRun", {}).get("content", "")
                 if paragraph_text.strip():
+                    para_counter += 1
                     text_chunks.append({
                         "text": paragraph_text.strip(),
-                        "paragraph": para_counter + 1,
-                        "preview": paragraph_text.strip()[:60]
+                        "meta": f"paragraph {para_counter} — starts with: \"{paragraph_text.strip()[:60]}...\""
                     })
-                    para_counter += 1
         return text_chunks
     except:
         return []
@@ -110,7 +109,7 @@ def read_pdf(file_id):
                 for chunk in chunk_text(text):
                     chunks.append({
                         "text": clean_pdf_text(chunk),
-                        "page": i + 1
+                        "meta": f"page {i + 1}"
                     })
         return chunks
     except:
@@ -123,10 +122,10 @@ def extract_all_chunks(shared_drive_id):
         link = f"https://drive.google.com/file/d/{file_id}"
         if mime == 'application/pdf':
             for chunk in read_pdf(file_id):
-                chunks.append({"text": chunk['text'], "meta": f"{name}, page {chunk['page']}", "link": link})
+                chunks.append({"text": chunk['text'], "meta": f"{name}, {chunk['meta']}", "link": link})
         elif mime == 'application/vnd.google-apps.document':
             for chunk in read_google_doc(file_id):
-                chunks.append({"text": chunk['text'], "meta": f"{name}, paragraph {chunk['paragraph']} — starts with: \"{chunk['preview']}...\"", "link": link})
+                chunks.append({"text": chunk['text'], "meta": f"{name}, {chunk['meta']}", "link": link})
         elif mime == 'application/vnd.google-apps.spreadsheet':
             sheet_text = read_google_sheet(file_id)
             for chunk in chunk_text(sheet_text):
@@ -162,7 +161,7 @@ def slack_events():
             if not relevant:
                 reply = "I cannot answer this question as the information is not in the provided documents."
             else:
-                context = "\n\n".join([f"FROM {c['meta']} ({c['link']}):\n{c['text']}" for c in relevant])
+                context = "\n\n".join([f"FROM {c['meta']}\n({c['link']}):\n{c['text']}" for c in relevant])
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"
                 try:
                     response = model.generate_content(prompt)
@@ -179,7 +178,7 @@ def slack_events():
 
 @app.route("/")
 def index():
-    return "✅ ConahGPT Slack bot with PDF page & Doc paragraph refs is running."
+    return "✅ ConahGPT Slack bot with PDF+Doc refs is running."
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
