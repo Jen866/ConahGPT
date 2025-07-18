@@ -32,23 +32,28 @@ gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
+# Gemini setup
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
-    You are Conah GPT, an expert business assistant for Actuary Consulting.
-    You answer questions based on the CONTEXT provided. Interpret meaning — don’t require exact matches.
-    If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
-    Always cite the source file with a clickable link, paragraph/page number, and short preview snippet.
-    You must only answer once — never repeat the same answer.
+    You are Conah GPT, a precise business assistant for Actuary Consulting.
+    Fully answer each question clearly based on the provided CONTEXT.
+    Only respond once per question. Include source citations at the end:
+    (Source: [Document Name], paragraph 5 — starts with: "Preview snippet...")
+    If source is a PDF, show page number instead of paragraph.
+    If answer is not available, say:
+    'I cannot answer this question as the information is not in the provided documents.'
     """
 )
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 
+# PDF cleanup
 def clean_pdf_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
+# File Readers
 def list_all_files_in_shared_drive(shared_drive_id):
     results = drive_service.files().list(
         q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
@@ -70,9 +75,8 @@ def read_google_sheet(file_id):
 def read_google_doc(file_id):
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
-        text = ""
-        para_count = 0
         paragraphs = []
+        para_count = 0
         for content_item in doc.get("body", {}).get("content", []):
             if "paragraph" in content_item:
                 para_text = ""
@@ -104,6 +108,7 @@ def read_pdf(file_id):
     except:
         return []
 
+# Chunking & Relevance
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
@@ -119,33 +124,29 @@ def extract_all_chunks(shared_drive_id):
             for i, chunk in enumerate(chunk_text(content)):
                 chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"row {i+1}"})
         elif mime_type == 'application/vnd.google-apps.document':
-            paragraphs = read_google_doc(file_id)
-            for para_num, para in paragraphs:
+            for para_num, para in read_google_doc(file_id):
                 chunks.append({"text": para, "source": name, "link": doc_link, "meta": f"paragraph {para_num}"})
         elif mime_type == 'application/pdf':
-            pages = read_pdf(file_id)
-            for page_num, text in pages:
+            for page_num, text in read_pdf(file_id):
                 for i, chunk in enumerate(chunk_text(text)):
                     chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"page {page_num}"})
     return chunks
 
 def get_relevant_chunks(question, chunks, top_k=5):
-    if not chunks:
-        return []
     documents = [chunk["text"] for chunk in chunks]
     vectorizer = TfidfVectorizer().fit(documents + [question])
     doc_vectors = vectorizer.transform(documents)
     question_vector = vectorizer.transform([question])
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     top_indices = similarities.argsort()[-top_k:][::-1]
-    seen = set()
-    filtered = []
+    seen_keys = set()
+    relevant = []
     for i in top_indices:
         key = chunks[i]['link'] + chunks[i]['meta']
-        if key not in seen and similarities[i] > 0.05:
-            seen.add(key)
-            filtered.append(chunks[i])
-    return filtered
+        if similarities[i] > 0.05 and key not in seen_keys:
+            seen_keys.add(key)
+            relevant.append(chunks[i])
+    return relevant
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -153,32 +154,35 @@ def slack_events():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    event = data.get("event", {})
-    if event.get("type") == "app_mention":
-        user_text = event.get("text", "")
-        channel_id = event.get("channel", "")
+    if data.get("event", {}).get("type") == "app_mention":
+        user_text = data["event"].get("text", "")
+        channel_id = data["event"].get("channel", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
         shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
         chunks = extract_all_chunks(shared_drive_id)
 
         if not chunks:
-            reply = "I couldn’t read any usable files from Google Drive. Please check the folder."
+            reply = "I couldn’t read any usable files from Google Drive."
         else:
             relevant_chunks = get_relevant_chunks(clean_text, chunks)
             if not relevant_chunks:
                 reply = "I cannot answer this question as the information is not in the provided documents."
             else:
-                context = "\n\n".join([f"FROM {chunk['source']} ({chunk['link']}):\n{chunk['text']}" for chunk in relevant_chunks])
+                context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
                 try:
                     gemini_response = model.generate_content(prompt)
                     raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
-
-                    first_chunk = relevant_chunks[0]
-                    snippet = first_chunk['text'][:60].split(". ")[0] + "..."
-                    citation = f"(Source: <{first_chunk['link']}|{first_chunk['source']}>, {first_chunk['meta']} — starts with: \"{snippet}\")"
-                    reply = f"{raw_answer}\n\n{citation}"
+                    citations = []
+                    seen = set()
+                    for chunk in relevant_chunks:
+                        key = chunk['link'] + chunk['meta']
+                        if key not in seen:
+                            seen.add(key)
+                            snippet = chunk['text'][:60].split(". ")[0].strip() + "..."
+                            citations.append(f"(Source: <{chunk['link']}|{chunk['source']}>, {chunk['meta']} — starts with: \"{snippet}\")")
+                    reply = f"{raw_answer}\n\n" + "\n".join(citations)
                 except Exception as e:
                     reply = f"⚠️ Error: {str(e)}"
 
@@ -191,7 +195,7 @@ def slack_events():
 
 @app.route("/")
 def index():
-    return "✅ ConahGPT Slack bot is running."
+    return "✅ ConahGPT is live."
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
