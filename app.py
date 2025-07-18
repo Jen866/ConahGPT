@@ -181,15 +181,16 @@ def slack_events():
                 try:
                     gemini_response = model.generate_content(prompt)
 
-                    # Remove duplicate paragraphs from Gemini output
+                    # Stronger duplicate paragraph filter
                     raw_answer = getattr(gemini_response, "text", "").strip()
-                    paragraphs = [p.strip() for p in raw_answer.split("\n\n") if p.strip()]
+                    paragraphs = re.split(r'\n\s*\n', raw_answer)
                     seen_paragraphs = set()
                     deduped_paragraphs = []
                     for para in paragraphs:
-                        if para not in seen_paragraphs:
-                            deduped_paragraphs.append(para)
-                            seen_paragraphs.add(para)
+                        clean_para = para.strip()
+                        if clean_para and clean_para not in seen_paragraphs:
+                            deduped_paragraphs.append(clean_para)
+                            seen_paragraphs.add(clean_para)
                     raw_answer = "\n\n".join(deduped_paragraphs) or "Oops, no answer returned."
 
                     citations = format_citations(relevant_chunks)
