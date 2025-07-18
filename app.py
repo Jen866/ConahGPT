@@ -29,45 +29,51 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents.readonly"
 ]
 
-SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
+# Load credentials from environment variable
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
+if not SERVICE_ACCOUNT_JSON:
+    raise ValueError("The SERVICE_ACCOUNT_JSON environment variable is not set.")
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SERVICE_ACCOUNT_JSON), SCOPES)
+
+# Build API clients
 gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
+# Configure the Generative AI model with a more forceful system instruction
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
-     You are Conah GPT, an expert business assistant for Actuary Consulting.
-     You answer questions based on the CONTEXT provided. Interpret the meaning — don’t require exact matches.
-     If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
-     Your answer should be concise and directly address the user's question.
-     Do not repeat information. Cite each source document only once.
-     """
+    You are an expert assistant. You MUST answer the user's question using ONLY the information from the provided CONTEXT.
+    Do not use any prior knowledge. The CONTEXT is the absolute source of truth.
+    If the answer is not available in the CONTEXT, you must say: 'I cannot answer this question as the information is not in the provided documents.'
+    Your answer should be concise. Cite each source document only once.
+    """
 )
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
-SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA" # Your Shared Drive ID
+SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"  # Your Shared Drive ID
 
-# --- Caching Mechanism (Improvement #4) ---
+# --- Caching Mechanism for Performance ---
 drive_chunks_cache = []
 cache_last_updated = None
 CACHE_DURATION = timedelta(minutes=10)
 cache_lock = Lock()
 
 def clean_text(text):
-    """Removes extra whitespace and newlines."""
+    """Removes extra whitespace and newlines for cleaner processing."""
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Google Drive Reading Functions (with improved chunking metadata) ---
+# --- Google Drive Reading Functions with Improved Metadata ---
 
 def read_google_sheet(file_id):
-    """Reads a Google Sheet and returns content as a single string."""
+    """Reads a Google Sheet and returns its content as a single string."""
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
         return "\n".join([str(row) for row in sheet.get_all_records()])
-    except Exception:
+    except Exception as e:
+        print(f"Error reading Google Sheet {file_id}: {e}")
         return ""
 
 def read_google_doc(file_id):
@@ -89,8 +95,8 @@ def read_google_doc(file_id):
                         "text": clean_text(current_paragraph),
                         "meta": {"paragraph": paragraph_index}
                     })
-    except Exception:
-        return []
+    except Exception as e:
+        print(f"Error reading Google Doc {file_id}: {e}")
     return chunks
 
 def read_pdf(file_id):
@@ -112,8 +118,8 @@ def read_pdf(file_id):
                         "text": clean_text(text),
                         "meta": {"page": i + 1}
                     })
-    except Exception:
-        return []
+    except Exception as e:
+        print(f"Error reading PDF {file_id}: {e}")
     return chunks
 
 # --- Content Processing and Caching ---
@@ -132,10 +138,10 @@ def extract_all_chunks(shared_drive_id):
             driveId=shared_drive_id,
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
-            fields="files(id, name, mimeType, webViewLink)"
+            fields="files(id, name, mimeType)"
         ).execute().get('files', [])
     except Exception as e:
-        print(f"Error listing files: {e}")
+        print(f"Error listing files from Drive: {e}")
         return []
 
     for file in files:
@@ -146,6 +152,7 @@ def extract_all_chunks(shared_drive_id):
         if file['mimeType'] == 'application/vnd.google-apps.spreadsheet':
             content = read_google_sheet(file_id)
             if content:
+                # Chunk large sheets into blocks
                 words = content.split()
                 for i in range(0, len(words), 300):
                     text_chunk = " ".join(words[i:i+300])
@@ -163,7 +170,7 @@ def extract_all_chunks(shared_drive_id):
             chunk['link'] = doc_link
             all_chunks.append(chunk)
 
-    print(f"Cache refreshed. Total chunks: {len(all_chunks)}")
+    print(f"Cache refreshed. Total chunks found: {len(all_chunks)}")
     return all_chunks
 
 
@@ -179,35 +186,36 @@ def refresh_cache_if_needed():
 
 def get_relevant_chunks(question, chunks, top_k=3):
     """
-    Finds the most relevant chunks using TF-IDF and cosine similarity.
-    (Improvement #1 & #4: top_k=3, deduplication handled post-retrieval)
+    Finds the most relevant and unique chunks using TF-IDF and cosine similarity.
     """
     if not chunks:
         return []
 
     documents = [chunk["text"] for chunk in chunks]
     try:
+        # Fit vectorizer on all docs + question to handle vocab
         vectorizer = TfidfVectorizer(stop_words='english').fit(documents + [question])
         doc_vectors = vectorizer.transform(documents)
         question_vector = vectorizer.transform([question])
-    except ValueError:
+    except ValueError: # Handles case where vocab is empty
         return []
 
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     
-    top_indices = similarities.argsort()[-top_k*2:][::-1]
+    # Get more than top_k initially to allow for deduplication
+    top_indices = similarities.argsort()[-top_k * 2:][::-1]
     
     relevant_chunks = []
     for i in top_indices:
-        if similarities[i] > 0.1: # Threshold to ensure relevance
+        if similarities[i] > 0.1:  # Relevance threshold
             chunk_with_score = chunks[i].copy()
             chunk_with_score['similarity'] = similarities[i]
             relevant_chunks.append(chunk_with_score)
 
+    # Sort by similarity to prioritize the best chunk for each source
     relevant_chunks.sort(key=lambda x: x['similarity'], reverse=True)
 
-    # --- Deduplication Logic (Improvement #1) ---
-    # Keep only the *most relevant* chunk for each source document.
+    # Deduplicate: Keep only the *most relevant* chunk for each source document.
     unique_sources = {}
     deduplicated_chunks = []
     for chunk in relevant_chunks:
@@ -221,8 +229,8 @@ def get_relevant_chunks(question, chunks, top_k=3):
 
 def format_citations(chunks):
     """
-    Formats citations according to the specified format.
-    (Improvement #2 & #3: Single citation per source, with link and preview)
+    Formats citations according to the required format:
+    (Source: [Name](link), location — starts with: "preview...")
     """
     if not chunks:
         return ""
@@ -242,6 +250,7 @@ def format_citations(chunks):
         else:
             location = "start of document"
             
+        # Create a preview of the first 8-12 words
         preview = " ".join(chunk['text'].split()[:10]) + "..."
         
         citation = f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")'
@@ -252,36 +261,51 @@ def format_citations(chunks):
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.json
+    # Respond to the Slack challenge
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
     event = data.get("event", {})
+    # Handle app mentions
     if event.get("type") == "app_mention":
         user_text = event.get("text", "")
         channel_id = event.get("channel", "")
+        # Remove the bot's @mention from the text
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
+        # Ensure the cache is fresh
         refresh_cache_if_needed()
         
         if not drive_chunks_cache:
             reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
         else:
+            # Step 1: Find relevant documents
             relevant_chunks = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
 
             if not relevant_chunks:
                 reply = "I cannot answer this question as the information is not in the provided documents."
             else:
-                context = "\n\n".join([f"Source: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
-                prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
+                # Step 2: Construct a direct and forceful prompt for the model
+                context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
+                prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
 
                 try:
+                    # Step 3: Generate the answer
                     gemini_response = model.generate_content(prompt)
                     raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
-                    citations = format_citations(relevant_chunks)
-                    reply = raw_answer + citations
+
+                    # Step 4: Add citations ONLY if the model provides a real answer
+                    if "I cannot answer" in raw_answer:
+                        reply = raw_answer
+                    else:
+                        citations = format_citations(relevant_chunks)
+                        reply = raw_answer + citations
+
                 except Exception as e:
+                    print(f"Error generating content from Gemini: {e}")
                     reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
 
+        # Step 5: Post the reply to Slack
         try:
             slack_client.chat_postMessage(channel=channel_id, text=reply)
         except SlackApiError as e:
@@ -291,12 +315,14 @@ def slack_events():
 
 @app.route("/")
 def index():
+    """A simple health check endpoint."""
     if not cache_last_updated:
         refresh_cache_if_needed()
-    status = "Cache is populated." if drive_chunks_cache else "Cache is empty, check Drive connection."
+    status = f"Cache is populated with {len(drive_chunks_cache)} chunks." if drive_chunks_cache else "Cache is empty, check Drive connection."
     return f"✅ ConahGPT Slack bot is running. {status}"
 
 if __name__ == "__main__":
+    # Pre-warm the cache on startup
     refresh_cache_if_needed()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
