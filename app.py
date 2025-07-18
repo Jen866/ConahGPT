@@ -180,7 +180,19 @@ def slack_events():
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
                 try:
                     gemini_response = model.generate_content(prompt)
-                    raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
+                    raw_answer = getattr(gemini_response, "text", "").strip()
+
+                    # Remove duplicate lines from the answer
+                    answer_lines = raw_answer.split("\n")
+                    seen_lines = set()
+                    deduped_lines = []
+                    for line in answer_lines:
+                        line_clean = line.strip()
+                        if line_clean and line_clean not in seen_lines:
+                            deduped_lines.append(line_clean)
+                            seen_lines.add(line_clean)
+                    raw_answer = "\n".join(deduped_lines) or "Oops, no answer returned."
+
                     citations = format_citations(relevant_chunks)
                     reply = f"{raw_answer}\n\n" + "\n".join(citations)
                 except Exception as e:
