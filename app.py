@@ -41,6 +41,7 @@ model = genai.GenerativeModel(
     You answer questions based on the CONTEXT provided. Interpret the meaning — don’t require exact matches.
     If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
     Always cite the source files used, with a clickable link.
+    Provide your answer ONLY ONCE and avoid repeating or restating it.
     """
 )
 
@@ -180,18 +181,22 @@ def slack_events():
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
                 try:
                     gemini_response = model.generate_content(prompt)
-
-                    # Stronger duplicate paragraph filter
                     raw_answer = getattr(gemini_response, "text", "").strip()
-                    paragraphs = re.split(r'\n\s*\n', raw_answer)
-                    seen_paragraphs = set()
-                    deduped_paragraphs = []
-                    for para in paragraphs:
-                        clean_para = para.strip()
-                        if clean_para and clean_para not in seen_paragraphs:
-                            deduped_paragraphs.append(clean_para)
-                            seen_paragraphs.add(clean_para)
-                    raw_answer = "\n\n".join(deduped_paragraphs) or "Oops, no answer returned."
+
+                    # Final deduplication fix for repeated full answers
+                    blocks = re.split(r'(\n\s*\n)+', raw_answer)
+                    seen_blocks = set()
+                    deduped = []
+                    for block in blocks:
+                        cleaned = block.strip()
+                        if cleaned and cleaned not in seen_blocks:
+                            deduped.append(cleaned)
+                            seen_blocks.add(cleaned)
+
+                    if len(deduped) == 2 and deduped[0] == deduped[1]:
+                        raw_answer = deduped[0]
+                    else:
+                        raw_answer = "\n\n".join(deduped) or "Oops, no answer returned."
 
                     citations = format_citations(relevant_chunks)
                     reply = f"{raw_answer}\n\n" + "\n".join(citations)
