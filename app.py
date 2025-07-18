@@ -12,13 +12,16 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from threading import Lock
+from datetime import datetime, timedelta
 
+# --- App Initialization ---
 app = Flask(__name__)
 CORS(app)
 
+# --- Global Configurations & Clients ---
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://spreadsheets.google.com/feeds",
@@ -32,64 +35,67 @@ gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
-# Gemini setup
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
     system_instruction="""
-    You are Conah GPT, a precise business assistant for Actuary Consulting.
-    Fully answer each question clearly based on the provided CONTEXT.
-    Only respond once per question. Include source citations at the end:
-    (Source: [Document Name], paragraph 5 — starts with: "Preview snippet...")
-    If source is a PDF, show page number instead of paragraph.
-    If answer is not available, say:
-    'I cannot answer this question as the information is not in the provided documents.'
-    """
+     You are Conah GPT, an expert business assistant for Actuary Consulting.
+     You answer questions based on the CONTEXT provided. Interpret the meaning — don’t require exact matches.
+     If the answer is not found, say: 'I cannot answer this question as the information is not in the provided documents.'
+     Your answer should be concise and directly address the user's question.
+     Do not repeat information. Cite each source document only once.
+     """
 )
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
+SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA" # Your Shared Drive ID
 
-# PDF cleanup
-def clean_pdf_text(text):
+# --- Caching Mechanism (Improvement #4) ---
+drive_chunks_cache = []
+cache_last_updated = None
+CACHE_DURATION = timedelta(minutes=10)
+cache_lock = Lock()
+
+def clean_text(text):
+    """Removes extra whitespace and newlines."""
     return re.sub(r'\s+', ' ', text).strip()
 
-# File Readers
-def list_all_files_in_shared_drive(shared_drive_id):
-    results = drive_service.files().list(
-        q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
-        corpora="drive",
-        driveId=shared_drive_id,
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-        fields="files(id, name, mimeType)"
-    ).execute()
-    return results.get('files', [])
+# --- Google Drive Reading Functions (with improved chunking metadata) ---
 
 def read_google_sheet(file_id):
+    """Reads a Google Sheet and returns content as a single string."""
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
         return "\n".join([str(row) for row in sheet.get_all_records()])
-    except:
+    except Exception:
         return ""
 
 def read_google_doc(file_id):
+    """Reads a Google Doc and returns a list of chunks, one per paragraph."""
+    chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
-        paragraphs = []
-        para_count = 0
-        for content_item in doc.get("body", {}).get("content", []):
+        doc_content = doc.get("body", {}).get("content", [])
+        paragraph_index = 0
+        for content_item in doc_content:
             if "paragraph" in content_item:
-                para_text = ""
-                for element in content_item["paragraph"].get("elements", []):
-                    para_text += element.get("textRun", {}).get("content", "")
-                if para_text.strip():
-                    para_count += 1
-                    paragraphs.append((para_count, para_text.strip()))
-        return paragraphs
-    except:
+                paragraph_index += 1
+                elements = content_item.get("paragraph", {}).get("elements", [])
+                current_paragraph = "".join(
+                    [elem.get("textRun", {}).get("content", "") for elem in elements]
+                )
+                if current_paragraph.strip():
+                    chunks.append({
+                        "text": clean_text(current_paragraph),
+                        "meta": {"paragraph": paragraph_index}
+                    })
+    except Exception:
         return []
+    return chunks
 
 def read_pdf(file_id):
+    """Reads a PDF and returns a list of chunks, one per page."""
+    chunks = []
     try:
         request_file = drive_service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -98,55 +104,150 @@ def read_pdf(file_id):
         while not done:
             _, done = downloader.next_chunk()
         fh.seek(0)
-        chunks = []
         with fitz.open(stream=fh, filetype="pdf") as pdf_doc:
-            for page_num, page in enumerate(pdf_doc, start=1):
-                text = page.get_text().strip()
-                if text:
-                    chunks.append((page_num, clean_pdf_text(text)))
-        return chunks
-    except:
+            for i, page in enumerate(pdf_doc):
+                text = page.get_text()
+                if text.strip():
+                    chunks.append({
+                        "text": clean_text(text),
+                        "meta": {"page": i + 1}
+                    })
+    except Exception:
         return []
-
-# Chunking & Relevance
-def chunk_text(text, chunk_size=300):
-    words = text.split()
-    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-
-def extract_all_chunks(shared_drive_id):
-    files = list_all_files_in_shared_drive(shared_drive_id)
-    chunks = []
-    for file in files:
-        file_id, name, mime_type = file['id'], file['name'], file['mimeType']
-        doc_link = f"https://drive.google.com/file/d/{file_id}"
-        if mime_type == 'application/vnd.google-apps.spreadsheet':
-            content = read_google_sheet(file_id)
-            for i, chunk in enumerate(chunk_text(content)):
-                chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"row {i+1}"})
-        elif mime_type == 'application/vnd.google-apps.document':
-            for para_num, para in read_google_doc(file_id):
-                chunks.append({"text": para, "source": name, "link": doc_link, "meta": f"paragraph {para_num}"})
-        elif mime_type == 'application/pdf':
-            for page_num, text in read_pdf(file_id):
-                for i, chunk in enumerate(chunk_text(text)):
-                    chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"page {page_num}"})
     return chunks
 
-def get_relevant_chunks(question, chunks, top_k=5):
+# --- Content Processing and Caching ---
+
+def extract_all_chunks(shared_drive_id):
+    """
+    Scans a Shared Drive for files, extracts text content, and creates structured chunks.
+    This is the core of the caching logic.
+    """
+    print("Refreshing Drive cache...")
+    all_chunks = []
+    try:
+        files = drive_service.files().list(
+            q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
+            corpora="drive",
+            driveId=shared_drive_id,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            fields="files(id, name, mimeType, webViewLink)"
+        ).execute().get('files', [])
+    except Exception as e:
+        print(f"Error listing files: {e}")
+        return []
+
+    for file in files:
+        file_id, name = file['id'], file['name']
+        doc_link = f"https://drive.google.com/file/d/{file_id}"
+
+        content_chunks = []
+        if file['mimeType'] == 'application/vnd.google-apps.spreadsheet':
+            content = read_google_sheet(file_id)
+            if content:
+                words = content.split()
+                for i in range(0, len(words), 300):
+                    text_chunk = " ".join(words[i:i+300])
+                    content_chunks.append({
+                        "text": text_chunk,
+                        "meta": {"block": (i // 300) + 1}
+                    })
+        elif file['mimeType'] == 'application/vnd.google-apps.document':
+            content_chunks = read_google_doc(file_id)
+        elif file['mimeType'] == 'application/pdf':
+            content_chunks = read_pdf(file_id)
+
+        for chunk in content_chunks:
+            chunk['source'] = name
+            chunk['link'] = doc_link
+            all_chunks.append(chunk)
+
+    print(f"Cache refreshed. Total chunks: {len(all_chunks)}")
+    return all_chunks
+
+
+def refresh_cache_if_needed():
+    """Checks cache freshness and refreshes it if it's stale."""
+    global drive_chunks_cache, cache_last_updated
+    with cache_lock:
+        if not cache_last_updated or (datetime.utcnow() - cache_last_updated > CACHE_DURATION):
+            drive_chunks_cache = extract_all_chunks(SHARED_DRIVE_ID)
+            cache_last_updated = datetime.utcnow()
+
+# --- RAG Core Logic ---
+
+def get_relevant_chunks(question, chunks, top_k=3):
+    """
+    Finds the most relevant chunks using TF-IDF and cosine similarity.
+    (Improvement #1 & #4: top_k=3, deduplication handled post-retrieval)
+    """
+    if not chunks:
+        return []
+
     documents = [chunk["text"] for chunk in chunks]
-    vectorizer = TfidfVectorizer().fit(documents + [question])
-    doc_vectors = vectorizer.transform(documents)
-    question_vector = vectorizer.transform([question])
+    try:
+        vectorizer = TfidfVectorizer(stop_words='english').fit(documents + [question])
+        doc_vectors = vectorizer.transform(documents)
+        question_vector = vectorizer.transform([question])
+    except ValueError:
+        return []
+
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
-    top_indices = similarities.argsort()[-top_k:][::-1]
-    seen_keys = set()
-    relevant = []
+    
+    top_indices = similarities.argsort()[-top_k*2:][::-1]
+    
+    relevant_chunks = []
     for i in top_indices:
-        key = chunks[i]['link'] + chunks[i]['meta']
-        if similarities[i] > 0.05 and key not in seen_keys:
-            seen_keys.add(key)
-            relevant.append(chunks[i])
-    return relevant
+        if similarities[i] > 0.1: # Threshold to ensure relevance
+            chunk_with_score = chunks[i].copy()
+            chunk_with_score['similarity'] = similarities[i]
+            relevant_chunks.append(chunk_with_score)
+
+    relevant_chunks.sort(key=lambda x: x['similarity'], reverse=True)
+
+    # --- Deduplication Logic (Improvement #1) ---
+    # Keep only the *most relevant* chunk for each source document.
+    unique_sources = {}
+    deduplicated_chunks = []
+    for chunk in relevant_chunks:
+        if chunk['source'] not in unique_sources:
+            unique_sources[chunk['source']] = True
+            deduplicated_chunks.append(chunk)
+
+    return deduplicated_chunks[:top_k]
+
+# --- Slack Integration & Flask Routes ---
+
+def format_citations(chunks):
+    """
+    Formats citations according to the specified format.
+    (Improvement #2 & #3: Single citation per source, with link and preview)
+    """
+    if not chunks:
+        return ""
+
+    citations = []
+    for chunk in chunks:
+        source_name = chunk['source']
+        link = chunk['link']
+        meta_info = chunk.get('meta', {})
+        
+        if 'page' in meta_info:
+            location = f"page {meta_info['page']}"
+        elif 'paragraph' in meta_info:
+            location = f"paragraph {meta_info['paragraph']}"
+        elif 'block' in meta_info:
+             location = f"data block {meta_info['block']}"
+        else:
+            location = "start of document"
+            
+        preview = " ".join(chunk['text'].split()[:10]) + "..."
+        
+        citation = f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")'
+        citations.append(citation)
+        
+    return "\n\n**Sources:**\n" + "\n".join(citations)
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -154,49 +255,48 @@ def slack_events():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    if data.get("event", {}).get("type") == "app_mention":
-        user_text = data["event"].get("text", "")
-        channel_id = data["event"].get("channel", "")
+    event = data.get("event", {})
+    if event.get("type") == "app_mention":
+        user_text = event.get("text", "")
+        channel_id = event.get("channel", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
-        shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
-        chunks = extract_all_chunks(shared_drive_id)
-
-        if not chunks:
-            reply = "I couldn’t read any usable files from Google Drive."
+        refresh_cache_if_needed()
+        
+        if not drive_chunks_cache:
+            reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
         else:
-            relevant_chunks = get_relevant_chunks(clean_text, chunks)
+            relevant_chunks = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
+
             if not relevant_chunks:
                 reply = "I cannot answer this question as the information is not in the provided documents."
             else:
-                context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
+                context = "\n\n".join([f"Source: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
                 prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
+
                 try:
                     gemini_response = model.generate_content(prompt)
-                    raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
-                    citations = []
-                    seen = set()
-                    for chunk in relevant_chunks:
-                        key = chunk['link'] + chunk['meta']
-                        if key not in seen:
-                            seen.add(key)
-                            snippet = chunk['text'][:60].split(". ")[0].strip() + "..."
-                            citations.append(f"(Source: <{chunk['link']}|{chunk['source']}>, {chunk['meta']} — starts with: \"{snippet}\")")
-                    reply = f"{raw_answer}\n\n" + "\n".join(citations)
+                    raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
+                    citations = format_citations(relevant_chunks)
+                    reply = raw_answer + citations
                 except Exception as e:
-                    reply = f"⚠️ Error: {str(e)}"
+                    reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
 
         try:
             slack_client.chat_postMessage(channel=channel_id, text=reply)
         except SlackApiError as e:
-            print("Slack API Error:", e.response["error"])
+            print(f"Slack API Error: {e.response['error']}")
 
     return Response(), 200
 
 @app.route("/")
 def index():
-    return "✅ ConahGPT is live."
+    if not cache_last_updated:
+        refresh_cache_if_needed()
+    status = "Cache is populated." if drive_chunks_cache else "Cache is empty, check Drive connection."
+    return f"✅ ConahGPT Slack bot is running. {status}"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    refresh_cache_if_needed()
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
