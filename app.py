@@ -4,7 +4,6 @@ import fitz  # PyMuPDF
 import gspread
 import json
 import re
-import google.generativeai as genai
 import threading
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -17,6 +16,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 from threading import Lock
+import google.generativeai as genai
 
 # --- App Initialization ---
 app = Flask(__name__)
@@ -172,6 +172,9 @@ def refresh_cache_if_needed():
 # --- RAG Core Logic ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
+    """
+    Finds the most relevant chunks and returns them along with their original indices.
+    """
     if not chunks: return []
     documents = [chunk["text"] for chunk in chunks]
     try:
@@ -184,34 +187,45 @@ def get_relevant_chunks(question, chunks, top_k=3):
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     top_indices = similarities.argsort()[-top_k * 2:][::-1]
     
-    relevant_chunks = []
+    results = []
     for i in top_indices:
         if similarities[i] > 0.1:
-            chunk_with_score = chunks[i].copy()
-            chunk_with_score['similarity'] = similarities[i]
-            relevant_chunks.append(chunk_with_score)
+            results.append({
+                "chunk": chunks[i],
+                "index": i,
+                "similarity": similarities[i]
+            })
 
-    relevant_chunks.sort(key=lambda x: x['similarity'], reverse=True)
+    results.sort(key=lambda x: x['similarity'], reverse=True)
+    
     unique_sources = {}
-    deduplicated_chunks = []
-    for chunk in relevant_chunks:
-        if chunk['source'] not in unique_sources:
-            unique_sources[chunk['source']] = True
-            deduplicated_chunks.append(chunk)
-    return deduplicated_chunks[:top_k]
+    deduplicated_results = []
+    for result in results:
+        if result['chunk']['source'] not in unique_sources:
+            unique_sources[result['chunk']['source']] = True
+            deduplicated_results.append(result)
+            
+    return deduplicated_results[:top_k]
 
 # --- Slack Integration & Flask Routes ---
 
 def format_citations(chunks):
     if not chunks: return ""
     citations = []
+    seen_sources = set()
     for chunk in chunks:
-        source_name, link, meta_info = chunk['source'], chunk['link'], chunk.get('meta', {})
+        source_name = chunk['source']
+        if source_name in seen_sources:
+            continue
+        
+        link, meta_info = chunk['link'], chunk.get('meta', {})
         location = f"page {meta_info['page']}" if 'page' in meta_info else \
                    f"paragraph {meta_info['paragraph']}" if 'paragraph' in meta_info else \
                    f"data block {meta_info['block']}" if 'block' in meta_info else "start of document"
         preview = " ".join(chunk['text'].split()[:10]) + "..."
         citations.append(f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")')
+        seen_sources.add(source_name)
+
     return "\n\n**Sources:**\n" + "\n".join(citations)
 
 def process_slack_event(channel_id, clean_text):
@@ -222,19 +236,45 @@ def process_slack_event(channel_id, clean_text):
     if not drive_chunks_cache:
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
-        relevant_chunks = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
-        if not relevant_chunks:
+        # Step 1: Retrieve relevant chunks
+        relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
+        
+        if not relevant_results:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
-            context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
+            # ✅ FIX: Create a "context window" around each relevant chunk
+            context_chunks = []
+            indices_added = set()
+
+            # Sort results by index to process them in document order
+            relevant_results.sort(key=lambda x: x['index'])
+
+            for result in relevant_results:
+                original_index = result['index']
+                original_source = result['chunk']['source']
+
+                # Create a window of context: 1 chunk before, the chunk itself, 1 chunk after
+                for i in range(original_index - 1, original_index + 2):
+                    # Check boundaries and ensure uniqueness
+                    if 0 <= i < len(drive_chunks_cache) and i not in indices_added:
+                        # Ensure the context chunk is from the same document
+                        potential_chunk = drive_chunks_cache[i]
+                        if potential_chunk['source'] == original_source:
+                            context_chunks.append(potential_chunk)
+                            indices_added.add(i)
+
+            # Step 2: Construct prompt and generate answer
+            context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
+            
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
                 if "I cannot answer" in raw_answer:
                     reply = raw_answer
                 else:
-                    citations = format_citations(relevant_chunks)
+                    # Cite based on the originally found chunks, not the expanded context
+                    citations = format_citations([res['chunk'] for res in relevant_results])
                     reply = raw_answer + citations
             except Exception as e:
                 print(f"Error generating content from Gemini: {e}")
@@ -250,7 +290,6 @@ def slack_events():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
     
-    # Check for event retries from Slack
     if request.headers.get('X-Slack-Retry-Num'):
         return Response(status=200)
 
@@ -260,11 +299,9 @@ def slack_events():
         user_text = event.get("text", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
         
-        # Start processing in a background thread
         thread = threading.Thread(target=process_slack_event, args=(channel_id, clean_text))
         thread.start()
 
-    # Acknowledge the event immediately to prevent retries
     return Response(status=200)
 
 @app.route("/")
