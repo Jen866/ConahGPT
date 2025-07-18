@@ -77,21 +77,28 @@ def read_google_sheet(file_id):
         return ""
 
 def read_google_doc(file_id):
+    """
+    Reads a Google Doc and correctly counts only non-empty paragraphs.
+    """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        paragraph_index = 0
+        paragraph_index = 0  # Initialize paragraph counter
         for content_item in doc_content:
+            # Check if the item is a paragraph
             if "paragraph" in content_item:
-                paragraph_index += 1
                 elements = content_item.get("paragraph", {}).get("elements", [])
-                current_paragraph = "".join(
+                # Combine all text runs in the paragraph
+                current_paragraph_text = "".join(
                     [elem.get("textRun", {}).get("content", "") for elem in elements]
                 )
-                if current_paragraph.strip():
+                
+                # ✅ FIX: Only count and process paragraphs that actually contain text
+                if current_paragraph_text.strip():
+                    paragraph_index += 1  # Increment counter ONLY for non-empty paragraphs
                     chunks.append({
-                        "text": clean_text(current_paragraph),
+                        "text": clean_text(current_paragraph_text),
                         "meta": {"paragraph": paragraph_index}
                     })
     except Exception as e:
@@ -172,9 +179,6 @@ def refresh_cache_if_needed():
 # --- RAG Core Logic ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
-    """
-    Finds the most relevant chunks and returns them along with their original indices.
-    """
     if not chunks: return []
     documents = [chunk["text"] for chunk in chunks]
     try:
@@ -229,41 +233,29 @@ def format_citations(chunks):
     return "\n\n**Sources:**\n" + "\n".join(citations)
 
 def process_slack_event(channel_id, clean_text):
-    """
-    This function runs in a background thread to handle the heavy lifting.
-    """
     refresh_cache_if_needed()
     if not drive_chunks_cache:
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
-        # Step 1: Retrieve relevant chunks
         relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
         
         if not relevant_results:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
-            # ✅ FIX: Create a "context window" around each relevant chunk
             context_chunks = []
             indices_added = set()
-
-            # Sort results by index to process them in document order
             relevant_results.sort(key=lambda x: x['index'])
 
             for result in relevant_results:
                 original_index = result['index']
                 original_source = result['chunk']['source']
-
-                # Create a window of context: 1 chunk before, the chunk itself, 1 chunk after
                 for i in range(original_index - 1, original_index + 2):
-                    # Check boundaries and ensure uniqueness
                     if 0 <= i < len(drive_chunks_cache) and i not in indices_added:
-                        # Ensure the context chunk is from the same document
                         potential_chunk = drive_chunks_cache[i]
                         if potential_chunk['source'] == original_source:
                             context_chunks.append(potential_chunk)
                             indices_added.add(i)
 
-            # Step 2: Construct prompt and generate answer
             context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
             
@@ -273,7 +265,6 @@ def process_slack_event(channel_id, clean_text):
                 if "I cannot answer" in raw_answer:
                     reply = raw_answer
                 else:
-                    # Cite based on the originally found chunks, not the expanded context
                     citations = format_citations([res['chunk'] for res in relevant_results])
                     reply = raw_answer + citations
             except Exception as e:
@@ -306,7 +297,6 @@ def slack_events():
 
 @app.route("/")
 def index():
-    """A simple health check endpoint."""
     if not cache_last_updated:
         refresh_cache_if_needed()
     status = f"Cache is populated with {len(drive_chunks_cache)} chunks." if drive_chunks_cache else "Cache is empty, check Drive connection."
