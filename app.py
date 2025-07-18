@@ -78,28 +78,38 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    Reads a Google Doc and correctly counts only non-empty paragraphs.
+    Reads a Google Doc, extracting manually numbered paragraphs where available.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        paragraph_index = 0  # Initialize paragraph counter
+        fallback_paragraph_index = 0
         for content_item in doc_content:
-            # Check if the item is a paragraph
             if "paragraph" in content_item:
                 elements = content_item.get("paragraph", {}).get("elements", [])
-                # Combine all text runs in the paragraph
                 current_paragraph_text = "".join(
                     [elem.get("textRun", {}).get("content", "") for elem in elements]
                 )
                 
-                # ✅ FIX: Only count and process paragraphs that actually contain text
-                if current_paragraph_text.strip():
-                    paragraph_index += 1  # Increment counter ONLY for non-empty paragraphs
+                cleaned_text = current_paragraph_text.strip()
+                if cleaned_text:
+                    fallback_paragraph_index += 1
+                    paragraph_number = fallback_paragraph_index
+                    
+                    # ✅ FIX: Look for an explicit number at the start of the paragraph
+                    match = re.match(r'^\s*(\d+)\.?', cleaned_text)
+                    if match:
+                        # If a number is found, use it as the paragraph number
+                        paragraph_number = int(match.group(1))
+                        # Remove the number from the text itself
+                        text_for_chunk = cleaned_text[match.end():].strip()
+                    else:
+                        text_for_chunk = cleaned_text
+                        
                     chunks.append({
-                        "text": clean_text(current_paragraph_text),
-                        "meta": {"paragraph": paragraph_index}
+                        "text": clean_text(text_for_chunk),
+                        "meta": {"paragraph": paragraph_number}
                     })
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
