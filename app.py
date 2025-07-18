@@ -4,6 +4,7 @@ import fitz  # PyMuPDF
 import gspread
 import json
 import re
+import difflib
 import google.generativeai as genai
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -183,20 +184,17 @@ def slack_events():
                     gemini_response = model.generate_content(prompt)
                     raw_answer = getattr(gemini_response, "text", "").strip()
 
-                    # Final deduplication fix for repeated full answers
-                    blocks = re.split(r'(\n\s*\n)+', raw_answer)
-                    seen_blocks = set()
-                    deduped = []
-                    for block in blocks:
-                        cleaned = block.strip()
-                        if cleaned and cleaned not in seen_blocks:
-                            deduped.append(cleaned)
-                            seen_blocks.add(cleaned)
-
-                    if len(deduped) == 2 and deduped[0] == deduped[1]:
-                        raw_answer = deduped[0]
-                    else:
-                        raw_answer = "\n\n".join(deduped) or "Oops, no answer returned."
+                    # Final anti-repeat filter using fuzzy matching
+                    lines = [line.strip() for line in re.split(r'[\.\n]', raw_answer) if line.strip()]
+                    unique_lines = []
+                    for line in lines:
+                        if not any(difflib.SequenceMatcher(None, line, seen).ratio() > 0.95 for seen in unique_lines):
+                            unique_lines.append(line)
+                    raw_answer = ". ".join(unique_lines).strip()
+                    if not raw_answer.endswith("."):
+                        raw_answer += "."
+                    if raw_answer.count(unique_lines[0]) > 1 and len(set(unique_lines)) == 1:
+                        raw_answer = unique_lines[0] + "."
 
                     citations = format_citations(relevant_chunks)
                     reply = f"{raw_answer}\n\n" + "\n".join(citations)
