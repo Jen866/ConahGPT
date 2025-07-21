@@ -53,7 +53,7 @@ model = genai.GenerativeModel(
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
 
-# --- Cache Setup ---
+# --- Caching Mechanism ---
 drive_chunks_cache = []
 cache_last_updated = None
 CACHE_DURATION = timedelta(minutes=10)
@@ -62,7 +62,7 @@ cache_lock = Lock()
 def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Google Drive File Readers ---
+# --- Google Drive Reading Functions ---
 
 def read_google_sheet(file_id):
     try:
@@ -73,40 +73,52 @@ def read_google_sheet(file_id):
         return ""
 
 def read_google_doc(file_id):
+    """
+    ✅ OPTION 1 IMPLEMENTATION: This function now identifies headings (bold & underlined)
+    and associates all subsequent paragraphs with that heading for accurate,
+    user-friendly citations.
+    """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        fallback_paragraph_index = 0
-
+        
+        current_heading = "General" # Default heading for content at the top
+        
         for content_item in doc_content:
             if "paragraph" not in content_item:
                 continue
 
             elements = content_item.get("paragraph", {}).get("elements", [])
-            full_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
-            if not full_text:
+            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+
+            if not p_text:
                 continue
 
-            fallback_paragraph_index += 1
-            paragraph_number = fallback_paragraph_index
-            text_for_chunk = full_text
+            # --- Heuristic to identify a heading ---
+            # A paragraph is considered a heading if all its text runs are bold and underlined.
+            is_heading = False
+            if elements:
+                is_heading = all(
+                    elem.get("textRun", {}).get("textStyle", {}).get("bold") and
+                    elem.get("textRun", {}).get("textStyle", {}).get("underline")
+                    for elem in elements if elem.get("textRun", {}).get("content", "").strip()
+                )
 
-            # ✅ Use a strict regex: match number + '.' or ')' + space
-            match = re.match(r'^\s*(\d+)[\.\)]\s+', full_text)
-            if match:
-                paragraph_number = int(match.group(1))
-                text_for_chunk = full_text[match.end():].strip()
-
-            chunks.append({
-                "text": clean_text(text_for_chunk),
-                "meta": {"paragraph": paragraph_number}
-            })
-
+            if is_heading:
+                current_heading = p_text
+                # We don't add headings as separate chunks, we just use them as labels.
+            else:
+                # This is a regular paragraph. Associate it with the last seen heading.
+                chunks.append({
+                    "text": clean_text(p_text),
+                    "meta": {"heading": current_heading}
+                })
+                
     except Exception as e:
-        print(f"Error reading Google Doc {file_id}: {e}")
-
+        print(f"Error in read_google_doc (Heading Logic): {e}")
     return chunks
+
 
 def read_pdf(file_id):
     chunks = []
@@ -130,7 +142,7 @@ def read_pdf(file_id):
         print(f"Error reading PDF {file_id}: {e}")
     return chunks
 
-# --- Chunk Extraction and Caching ---
+# --- Content Processing and Caching ---
 
 def extract_all_chunks(shared_drive_id):
     print("Refreshing Drive cache...")
@@ -157,8 +169,8 @@ def extract_all_chunks(shared_drive_id):
             if content:
                 words = content.split()
                 for i in range(0, len(words), 300):
-                    chunk = " ".join(words[i:i+300])
-                    content_chunks.append({"text": chunk, "meta": {"block": (i // 300) + 1}})
+                    text_chunk = " ".join(words[i:i+300])
+                    content_chunks.append({"text": text_chunk, "meta": {"block": (i // 300) + 1}})
         elif file['mimeType'] == 'application/vnd.google-apps.document':
             content_chunks = read_google_doc(file_id)
         elif file['mimeType'] == 'application/pdf':
@@ -179,7 +191,7 @@ def refresh_cache_if_needed():
             drive_chunks_cache = extract_all_chunks(SHARED_DRIVE_ID)
             cache_last_updated = datetime.utcnow()
 
-# --- RAG Logic ---
+# --- RAG Core Logic ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
     if not chunks: return []
@@ -197,39 +209,43 @@ def get_relevant_chunks(question, chunks, top_k=3):
     results = []
     for i in top_indices:
         if similarities[i] > 0.1:
-            results.append({
-                "chunk": chunks[i],
-                "index": i,
-                "similarity": similarities[i]
-            })
-
-    results.sort(key=lambda x: x['similarity'], reverse=True)
+            results.append(chunks[i])
 
     unique_sources = {}
-    deduplicated_results = []
-    for result in results:
-        if result['chunk']['source'] not in unique_sources:
-            unique_sources[result['chunk']['source']] = True
-            deduplicated_results.append(result)
+    deduplicated_chunks = []
+    for chunk in results:
+        if chunk['source'] not in unique_sources:
+            unique_sources[chunk['source']] = True
+            deduplicated_chunks.append(chunk)
+            
+    return deduplicated_chunks[:top_k]
 
-    return deduplicated_results[:top_k]
+# --- Slack Integration & Flask Routes ---
 
 def format_citations(chunks):
+    """
+    ✅ OPTION 1 IMPLEMENTATION: This function now formats citations to use the
+    section heading for Google Docs, providing a more stable reference.
+    """
     if not chunks: return ""
     citations = []
-    seen_sources = set()
     for chunk in chunks:
         source_name = chunk['source']
-        if source_name in seen_sources:
-            continue
-
-        link, meta_info = chunk['link'], chunk.get('meta', {})
-        location = f"page {meta_info['page']}" if 'page' in meta_info else \
-                   f"paragraph {meta_info['paragraph']}" if 'paragraph' in meta_info else \
-                   f"data block {meta_info['block']}" if 'block' in meta_info else "start of document"
+        link = chunk['link']
+        meta_info = chunk.get('meta', {})
+        
+        # Determine the location type based on available metadata
+        if 'heading' in meta_info:
+            location = f'in section "{meta_info["heading"]}"'
+        elif 'page' in meta_info:
+            location = f"on page {meta_info['page']}"
+        elif 'block' in meta_info:
+            location = f"in data block {meta_info['block']}"
+        else:
+            location = "near the start of the document"
+        
         preview = " ".join(chunk['text'].split()[:10]) + "..."
         citations.append(f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")')
-        seen_sources.add(source_name)
 
     return "\n\n**Sources:**\n" + "\n".join(citations)
 
@@ -238,5 +254,58 @@ def process_slack_event(channel_id, clean_text):
     if not drive_chunks_cache:
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
-        relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
+        relevant_chunks = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
+        
+        if not relevant_chunks:
+            reply = "I cannot answer this question as the information is not in the provided documents."
+        else:
+            context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
+            prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
+            
+            try:
+                gemini_response = model.generate_content(prompt)
+                raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
+                if "I cannot answer" in raw_answer:
+                    reply = raw_answer
+                else:
+                    citations = format_citations(relevant_chunks)
+                    reply = raw_answer + citations
+            except Exception as e:
+                print(f"Error generating content from Gemini: {e}")
+                reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
+    try:
+        slack_client.chat_postMessage(channel=channel_id, text=reply)
+    except SlackApiError as e:
+        print(f"Slack API Error: {e.response['error']}")
 
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    data = request.json
+    if "challenge" in data:
+        return jsonify({"challenge": data["challenge"]})
+    
+    if request.headers.get('X-Slack-Retry-Num'):
+        return Response(status=200)
+
+    event = data.get("event", {})
+    if event.get("type") == "app_mention":
+        channel_id = event.get("channel", "")
+        user_text = event.get("text", "")
+        clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
+        
+        thread = threading.Thread(target=process_slack_event, args=(channel_id, clean_text))
+        thread.start()
+
+    return Response(status=200)
+
+@app.route("/")
+def index():
+    if not cache_last_updated:
+        refresh_cache_if_needed()
+    status = f"Cache is populated with {len(drive_chunks_cache)} chunks." if drive_chunks_cache else "Cache is empty, check Drive connection."
+    return f"✅ ConahGPT Slack bot is running. {status}"
+
+if __name__ == "__main__":
+    refresh_cache_if_needed()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
