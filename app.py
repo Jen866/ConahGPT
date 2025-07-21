@@ -74,15 +74,14 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ FINAL FIX V2: This function now reliably extracts manually-entered paragraph
-    numbers for citations while still grouping Q&A pairs for context.
+    This function intelligently groups manually numbered questions and their
+    corresponding answers into single, logical chunks for accurate context and citation.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
-        internal_para_counter = 0
         i = 0
         while i < len(doc_content):
             content_item = doc_content[i]
@@ -93,51 +92,47 @@ def read_google_doc(file_id):
             elements = content_item.get("paragraph", {}).get("elements", [])
             p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
 
-            if not p_text:
+            # Find paragraphs that start with a number (e.g., "61.")
+            match = re.match(r'^\s*(\d+)\.?', p_text)
+            
+            # If it's not a numbered paragraph, we skip it.
+            if not match:
                 i += 1
                 continue
-            
-            internal_para_counter += 1
-            citation_number = internal_para_counter # Default to internal count
 
-            # Try to find a manually entered number (e.g., "61.")
-            match = re.match(r'^\s*(\d+)\.?', p_text)
-            if match:
-                citation_number = int(match.group(1)) # Use the number from the doc
+            # This is a numbered paragraph.
+            citation_number = int(match.group(1))
+            question_text = p_text
 
-            # Heuristic: A line ending in '?' is a question.
-            if p_text.endswith('?'):
-                question_text = p_text
-                answer_text = ""
-                
-                # Look ahead for the answer
-                next_i = i + 1
-                while next_i < len(doc_content):
-                    next_content_item = doc_content[next_i]
-                    if "paragraph" in next_content_item:
-                        next_elements = next_content_item.get("paragraph", {}).get("elements", [])
-                        next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
-                        if next_p_text:
-                            answer_text = next_p_text
-                            i = next_i # Consume the answer paragraph
-                            break
-                    next_i += 1
+            answer_text = ""
+            # Look ahead to find the answer in the next non-empty, non-numbered paragraph.
+            next_i = i + 1
+            while next_i < len(doc_content):
+                next_content_item = doc_content[next_i]
+                if "paragraph" in next_content_item:
+                    next_elements = next_content_item.get("paragraph", {}).get("elements", [])
+                    next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
+                    
+                    if next_p_text:
+                        # If the next line is also numbered, it's a new question, so stop.
+                        if re.match(r'^\s*(\d+)\.?', next_p_text):
+                            break 
+                        # Otherwise, this is the answer.
+                        answer_text = next_p_text
+                        i = next_i # Consume the answer paragraph
+                        break
+                next_i += 1
 
-                full_text = f"Question: {question_text} Answer: {answer_text}"
-                chunks.append({
-                    "text": clean_text(full_text),
-                    "meta": {"paragraph": citation_number}
-                })
-            else:
-                # It's a standalone paragraph
-                chunks.append({
-                    "text": clean_text(p_text),
-                    "meta": {"paragraph": citation_number}
-                })
+            # Create a single, logical chunk for the Q&A pair.
+            full_text = f"Question: {question_text} Answer: {answer_text}"
+            chunks.append({
+                "text": clean_text(full_text),
+                "meta": {"paragraph": citation_number}
+            })
             
             i += 1
     except Exception as e:
-        print(f"Error reading Google Doc {file_id}: {e}")
+        print(f"Error reading Google Doc with numbered list logic: {e}")
     return chunks
 
 def read_pdf(file_id):
