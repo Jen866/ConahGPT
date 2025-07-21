@@ -74,7 +74,9 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    Reads a Google Doc and chunks it by paragraph, assigning a paragraph number.
+    ✅ FINAL FIX: This function now intelligently groups questions and their
+    corresponding answers into a single chunk, while also tracking the correct
+    paragraph number for accurate citations.
     """
     chunks = []
     try:
@@ -82,25 +84,62 @@ def read_google_doc(file_id):
         doc_content = doc.get("body", {}).get("content", [])
         
         paragraph_count = 0
-        for content_item in doc_content:
-            if "paragraph" in content_item:
-                elements = content_item.get("paragraph", {}).get("elements", [])
-                p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+        i = 0
+        while i < len(doc_content):
+            content_item = doc_content[i]
+            if "paragraph" not in content_item:
+                i += 1
+                continue
+            
+            elements = content_item.get("paragraph", {}).get("elements", [])
+            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
 
-                if p_text: # Only count and add non-empty paragraphs
-                    paragraph_count += 1
-                    chunks.append({
-                        "text": clean_text(p_text),
-                        "meta": {"paragraph": paragraph_count}
-                    })
+            # Skip empty paragraphs
+            if not p_text:
+                i += 1
+                continue
+            
+            paragraph_count += 1
+            
+            # Heuristic: A line ending in '?' is a question.
+            if p_text.endswith('?'):
+                question_text = p_text
+                question_paragraph_number = paragraph_count
+                answer_text = ""
+                
+                # Look ahead to find the next non-empty paragraph for the answer.
+                next_i = i + 1
+                while next_i < len(doc_content):
+                    next_content_item = doc_content[next_i]
+                    if "paragraph" in next_content_item:
+                        next_elements = next_content_item.get("paragraph", {}).get("elements", [])
+                        next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
+                        if next_p_text:
+                            answer_text = next_p_text
+                            i = next_i # Consume the answer paragraph
+                            break
+                    next_i += 1
+
+                # Create a single, logical chunk with both Q&A.
+                full_text = f"Question: {question_text} Answer: {answer_text}"
+                chunks.append({
+                    "text": clean_text(full_text),
+                    "meta": {"paragraph": question_paragraph_number}
+                })
+            else:
+                # If it's not a question, treat it as a standalone paragraph.
+                chunks.append({
+                    "text": clean_text(p_text),
+                    "meta": {"paragraph": paragraph_count}
+                })
+            
+            i += 1
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
     return chunks
 
+
 def read_pdf(file_id):
-    """
-    Reads a PDF and chunks it by page, assigning a page number.
-    """
     chunks = []
     try:
         request_file = drive_service.files().get_media(fileId=file_id)
@@ -203,10 +242,6 @@ def get_relevant_chunks(question, chunks, top_k=3):
 # --- Slack Integration & Flask Routes ---
 
 def format_citations(chunks):
-    """
-    ✅ FINAL FIX: This function now provides the best possible location for each
-    document type: page for PDFs, paragraph for Docs, and block for Sheets.
-    """
     if not chunks: return ""
     citations = []
     for chunk in chunks:
@@ -214,7 +249,6 @@ def format_citations(chunks):
         link = chunk['link']
         meta_info = chunk.get('meta', {})
         
-        # Determine the location type based on available metadata
         if 'page' in meta_info:
             location = f"on page {meta_info['page']}"
         elif 'paragraph' in meta_info:
