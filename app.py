@@ -1,6 +1,7 @@
+# 🚀 FULL CONAH GPT - FAQ PARAGRAPH MATCHING FROM GOOGLE DOC
 import os
 import io
-import fitz  # PyMuPDF
+import fitz
 import gspread
 import json
 import re
@@ -17,13 +18,12 @@ from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 from threading import Lock
 import google.generativeai as genai
-from docx import Document  # NEW
 
 # --- App Initialization ---
 app = Flask(__name__)
 CORS(app)
 
-# --- Global Configurations & Clients ---
+# --- Configs & Credentials ---
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://spreadsheets.google.com/feeds",
@@ -53,23 +53,7 @@ model = genai.GenerativeModel(
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
-
-# --- Paragraph Mapping from FAQ DOCX ---
-def load_paragraph_number_map(path="FAQ’s (1).docx"):
-    paragraph_map = {}
-    try:
-        doc = Document(os.path.join("/mnt/data", path))
-        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        count = 1
-        for para in paragraphs:
-            if para.endswith("?"):
-                paragraph_map[para[:60].lower()] = count
-                count += 1
-    except Exception as e:
-        print(f"Error loading FAQ docx: {e}")
-    return paragraph_map
-
-FAQ_PARAGRAPH_MAP = load_paragraph_number_map()
+FAQ_DOC_ID = "YOUR_FILE_ID_HERE"  # ⬅️ Replace this with your real Google Doc ID
 
 # --- Cache ---
 drive_chunks_cache = []
@@ -79,6 +63,28 @@ cache_lock = Lock()
 
 def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
+
+# --- Extract Paragraph Map from the FAQ Google Doc ---
+def load_paragraph_number_map(file_id):
+    paragraph_map = {}
+    try:
+        doc = docs_service.documents().get(documentId=file_id).execute()
+        content = doc.get("body", {}).get("content", [])
+        count = 1
+        for item in content:
+            if "paragraph" in item:
+                text = "".join([
+                    el.get("textRun", {}).get("content", "")
+                    for el in item.get("paragraph", {}).get("elements", [])
+                ]).strip()
+                if text.endswith("?"):
+                    paragraph_map[text[:60].lower()] = count
+                    count += 1
+    except Exception as e:
+        print(f"Error loading paragraph map from Google Doc: {e}")
+    return paragraph_map
+
+FAQ_PARAGRAPH_MAP = load_paragraph_number_map(FAQ_DOC_ID)
 
 # --- Google File Readers ---
 
@@ -95,20 +101,22 @@ def read_google_doc(file_id):
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        for content_item in doc_content:
-            if "paragraph" in content_item:
-                elements = content_item.get("paragraph", {}).get("elements", [])
-                full_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+        for item in doc_content:
+            if "paragraph" in item:
+                elements = item.get("paragraph", {}).get("elements", [])
+                full_text = "".join([
+                    el.get("textRun", {}).get("content", "") for el in elements
+                ]).strip()
                 if full_text:
                     cleaned = clean_text(full_text)
-                    paragraph_number = None
-                    for q_prefix, number in FAQ_PARAGRAPH_MAP.items():
-                        if cleaned.lower().startswith(q_prefix):
-                            paragraph_number = number
+                    para_num = None
+                    for q_text, number in FAQ_PARAGRAPH_MAP.items():
+                        if cleaned.lower().startswith(q_text):
+                            para_num = number
                             break
                     chunks.append({
                         "text": cleaned,
-                        "meta": {"paragraph": paragraph_number} if paragraph_number else {}
+                        "meta": {"paragraph": para_num} if para_num else {}
                     })
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
@@ -136,7 +144,7 @@ def read_pdf(file_id):
         print(f"Error reading PDF {file_id}: {e}")
     return chunks
 
-# --- Content Processing ---
+# --- Content Aggregator ---
 
 def extract_all_chunks(shared_drive_id):
     print("Refreshing Drive cache...")
@@ -185,7 +193,7 @@ def refresh_cache_if_needed():
             drive_chunks_cache = extract_all_chunks(SHARED_DRIVE_ID)
             cache_last_updated = datetime.utcnow()
 
-# --- RAG Logic ---
+# --- Core RAG Matching ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
     if not chunks: return []
@@ -211,36 +219,33 @@ def get_relevant_chunks(question, chunks, top_k=3):
 
     results.sort(key=lambda x: x['similarity'], reverse=True)
     seen_sources = {}
-    deduplicated = []
+    deduped = []
     for res in results:
         src = res['chunk']['source']
         if src not in seen_sources:
             seen_sources[src] = True
-            deduplicated.append(res)
-    return deduplicated[:top_k]
-
-# --- Format Response ---
+            deduped.append(res)
+    return deduped[:top_k]
 
 def format_citations(chunks):
     if not chunks: return ""
     citations = []
-    seen_sources = set()
+    seen = set()
     for chunk in chunks:
         source = chunk['source']
-        if source in seen_sources: continue
+        if source in seen: continue
         meta = chunk.get('meta', {})
         location = (
             f"paragraph {meta['paragraph']}" if 'paragraph' in meta else
             f"page {meta['page']}" if 'page' in meta else
-            f"data block {meta['block']}" if 'block' in meta else
-            "start of document"
+            f"block {meta['block']}" if 'block' in meta else "start of document"
         )
-        preview = " ".join(chunk['text'].split()[:10]) + "..."
-        citations.append(f'(Source: [{source}]({chunk["link"]}), {location} — starts with: "{preview}")')
-        seen_sources.add(source)
+        snippet = " ".join(chunk['text'].split()[:10]) + "..."
+        citations.append(f"(Source: [{source}]({chunk['link']}), {location} — starts with: \"{snippet}\")")
+        seen.add(source)
     return "\n\n**Sources:**\n" + "\n".join(citations)
 
-# --- Slack Logic ---
+# --- Slack Bot Handler ---
 
 def process_slack_event(channel_id, clean_text):
     refresh_cache_if_needed()
@@ -267,7 +272,6 @@ def process_slack_event(channel_id, clean_text):
 
             context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
-            
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
@@ -276,8 +280,8 @@ def process_slack_event(channel_id, clean_text):
                 else:
                     reply = raw_answer + format_citations(context_chunks)
             except Exception as e:
-                print(f"Error generating content from Gemini: {e}")
-                reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
+                print(f"Gemini error: {e}")
+                reply = f"⚠️ Error generating answer: {str(e)}"
     try:
         slack_client.chat_postMessage(channel=channel_id, text=reply)
     except SlackApiError as e:
