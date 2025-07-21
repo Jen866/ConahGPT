@@ -74,49 +74,79 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ OPTION 1 IMPLEMENTATION: This function now identifies headings (bold & underlined)
-    and associates all subsequent paragraphs with that heading for accurate,
-    user-friendly citations.
+    ✅ DEFINITIVE FIX: This logic combines heading detection with Q&A pairing.
+    It identifies headings, then groups questions and their subsequent answers
+    into a single chunk, associated with the correct heading for robust context
+    and accurate citations.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
-        current_heading = "General" # Default heading for content at the top
-        
+        # First, create a clean list of paragraphs with their styles.
+        # This avoids the complexity of the raw API response structure.
+        all_paragraphs_with_style = []
         for content_item in doc_content:
-            if "paragraph" not in content_item:
-                continue
+            if "paragraph" in content_item:
+                elements = content_item.get("paragraph", {}).get("elements", [])
+                p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+                
+                if not p_text:
+                    continue
 
-            elements = content_item.get("paragraph", {}).get("elements", [])
-            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+                # Determine if the paragraph is a heading (bold and underlined)
+                is_heading = False
+                if elements:
+                    is_heading = all(
+                        elem.get("textRun", {}).get("textStyle", {}).get("bold") and
+                        elem.get("textRun", {}).get("textStyle", {}).get("underline")
+                        for elem in elements if elem.get("textRun", {}).get("content", "").strip()
+                    )
+                all_paragraphs_with_style.append({"text": p_text, "is_heading": is_heading})
 
-            if not p_text:
-                continue
-
-            # --- Heuristic to identify a heading ---
-            # A paragraph is considered a heading if all its text runs are bold and underlined.
-            is_heading = False
-            if elements:
-                is_heading = all(
-                    elem.get("textRun", {}).get("textStyle", {}).get("bold") and
-                    elem.get("textRun", {}).get("textStyle", {}).get("underline")
-                    for elem in elements if elem.get("textRun", {}).get("content", "").strip()
-                )
-
-            if is_heading:
+        # Now, iterate through the clean list to build chunks.
+        current_heading = "General"
+        i = 0
+        while i < len(all_paragraphs_with_style):
+            para_info = all_paragraphs_with_style[i]
+            p_text = para_info["text"]
+            
+            if para_info["is_heading"]:
                 current_heading = p_text
-                # We don't add headings as separate chunks, we just use them as labels.
+                i += 1
+                continue
+
+            # It's a regular paragraph. Check if it's a question.
+            if p_text.endswith('?'):
+                question_text = p_text
+                answer_text = ""
+                
+                # Look at the next paragraph to see if it's the answer.
+                if (i + 1) < len(all_paragraphs_with_style):
+                    next_para_info = all_paragraphs_with_style[i+1]
+                    # The answer is the next line if it's not another heading.
+                    if not next_para_info["is_heading"]:
+                        answer_text = next_para_info["text"]
+                        i += 1 # Consume the answer paragraph.
+                
+                # Create the combined chunk for full context.
+                full_text = f"Question: {question_text} Answer: {answer_text}"
+                chunks.append({
+                    "text": clean_text(full_text),
+                    "meta": {"heading": current_heading}
+                })
             else:
-                # This is a regular paragraph. Associate it with the last seen heading.
+                # It's a standalone paragraph (not a question, not a heading).
                 chunks.append({
                     "text": clean_text(p_text),
                     "meta": {"heading": current_heading}
                 })
-                
+            
+            i += 1
+            
     except Exception as e:
-        print(f"Error in read_google_doc (Heading Logic): {e}")
+        print(f"Error in read_google_doc (Heading & Q&A Logic): {e}")
     return chunks
 
 
@@ -223,10 +253,6 @@ def get_relevant_chunks(question, chunks, top_k=3):
 # --- Slack Integration & Flask Routes ---
 
 def format_citations(chunks):
-    """
-    ✅ OPTION 1 IMPLEMENTATION: This function now formats citations to use the
-    section heading for Google Docs, providing a more stable reference.
-    """
     if not chunks: return ""
     citations = []
     for chunk in chunks:
@@ -234,7 +260,6 @@ def format_citations(chunks):
         link = chunk['link']
         meta_info = chunk.get('meta', {})
         
-        # Determine the location type based on available metadata
         if 'heading' in meta_info:
             location = f'in section "{meta_info["heading"]}"'
         elif 'page' in meta_info:
