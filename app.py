@@ -74,16 +74,15 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ FINAL FIX: This function now intelligently groups questions and their
-    corresponding answers into a single chunk, while also tracking the correct
-    paragraph number for accurate citations.
+    ✅ FINAL FIX V2: This function now reliably extracts manually-entered paragraph
+    numbers for citations while still grouping Q&A pairs for context.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
-        paragraph_count = 0
+        internal_para_counter = 0
         i = 0
         while i < len(doc_content):
             content_item = doc_content[i]
@@ -94,20 +93,24 @@ def read_google_doc(file_id):
             elements = content_item.get("paragraph", {}).get("elements", [])
             p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
 
-            # Skip empty paragraphs
             if not p_text:
                 i += 1
                 continue
             
-            paragraph_count += 1
-            
+            internal_para_counter += 1
+            citation_number = internal_para_counter # Default to internal count
+
+            # Try to find a manually entered number (e.g., "61.")
+            match = re.match(r'^\s*(\d+)\.?', p_text)
+            if match:
+                citation_number = int(match.group(1)) # Use the number from the doc
+
             # Heuristic: A line ending in '?' is a question.
             if p_text.endswith('?'):
                 question_text = p_text
-                question_paragraph_number = paragraph_count
                 answer_text = ""
                 
-                # Look ahead to find the next non-empty paragraph for the answer.
+                # Look ahead for the answer
                 next_i = i + 1
                 while next_i < len(doc_content):
                     next_content_item = doc_content[next_i]
@@ -120,24 +123,22 @@ def read_google_doc(file_id):
                             break
                     next_i += 1
 
-                # Create a single, logical chunk with both Q&A.
                 full_text = f"Question: {question_text} Answer: {answer_text}"
                 chunks.append({
                     "text": clean_text(full_text),
-                    "meta": {"paragraph": question_paragraph_number}
+                    "meta": {"paragraph": citation_number}
                 })
             else:
-                # If it's not a question, treat it as a standalone paragraph.
+                # It's a standalone paragraph
                 chunks.append({
                     "text": clean_text(p_text),
-                    "meta": {"paragraph": paragraph_count}
+                    "meta": {"paragraph": citation_number}
                 })
             
             i += 1
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
     return chunks
-
 
 def read_pdf(file_id):
     chunks = []
