@@ -17,6 +17,7 @@ from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 from threading import Lock
 import google.generativeai as genai
+from docx import Document  # NEW
 
 # --- App Initialization ---
 app = Flask(__name__)
@@ -30,18 +31,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents.readonly"
 ]
 
-# Load credentials from environment variable
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 if not SERVICE_ACCOUNT_JSON:
     raise ValueError("The SERVICE_ACCOUNT_JSON environment variable is not set.")
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SERVICE_ACCOUNT_JSON), SCOPES)
 
-# Build API clients
 gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
-# Configure the Generative AI model
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
@@ -56,17 +54,33 @@ model = genai.GenerativeModel(
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
 
-# --- Caching Mechanism for Performance ---
+# --- Paragraph Mapping from FAQ DOCX ---
+def load_paragraph_number_map(path="FAQ’s (1).docx"):
+    paragraph_map = {}
+    try:
+        doc = Document(os.path.join("/mnt/data", path))
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        count = 1
+        for para in paragraphs:
+            if para.endswith("?"):
+                paragraph_map[para[:60].lower()] = count
+                count += 1
+    except Exception as e:
+        print(f"Error loading FAQ docx: {e}")
+    return paragraph_map
+
+FAQ_PARAGRAPH_MAP = load_paragraph_number_map()
+
+# --- Cache ---
 drive_chunks_cache = []
 cache_last_updated = None
 CACHE_DURATION = timedelta(minutes=10)
 cache_lock = Lock()
 
 def clean_text(text):
-    """Removes extra whitespace and newlines."""
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Google Drive Reading Functions ---
+# --- Google File Readers ---
 
 def read_google_sheet(file_id):
     try:
@@ -81,26 +95,20 @@ def read_google_doc(file_id):
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        fallback_paragraph_index = 0
         for content_item in doc_content:
             if "paragraph" in content_item:
                 elements = content_item.get("paragraph", {}).get("elements", [])
-                current_paragraph_text = "".join(
-                    [elem.get("textRun", {}).get("content", "") for elem in elements]
-                )
-                cleaned_text = current_paragraph_text.strip()
-                if cleaned_text:
-                    fallback_paragraph_index += 1
-                    paragraph_number = fallback_paragraph_index
-                    match = re.match(r'^\s*(\d+)\.?', cleaned_text)
-                    if match:
-                        paragraph_number = int(match.group(1))
-                        text_for_chunk = cleaned_text[match.end():].strip()
-                    else:
-                        text_for_chunk = cleaned_text
+                full_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+                if full_text:
+                    cleaned = clean_text(full_text)
+                    paragraph_number = None
+                    for q_prefix, number in FAQ_PARAGRAPH_MAP.items():
+                        if cleaned.lower().startswith(q_prefix):
+                            paragraph_number = number
+                            break
                     chunks.append({
-                        "text": clean_text(text_for_chunk),
-                        "meta": {"paragraph": paragraph_number}
+                        "text": cleaned,
+                        "meta": {"paragraph": paragraph_number} if paragraph_number else {}
                     })
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
@@ -128,7 +136,7 @@ def read_pdf(file_id):
         print(f"Error reading PDF {file_id}: {e}")
     return chunks
 
-# --- Content Processing and Caching ---
+# --- Content Processing ---
 
 def extract_all_chunks(shared_drive_id):
     print("Refreshing Drive cache...")
@@ -177,7 +185,7 @@ def refresh_cache_if_needed():
             drive_chunks_cache = extract_all_chunks(SHARED_DRIVE_ID)
             cache_last_updated = datetime.utcnow()
 
-# --- RAG Core Logic ---
+# --- RAG Logic ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
     if not chunks: return []
@@ -202,36 +210,37 @@ def get_relevant_chunks(question, chunks, top_k=3):
             })
 
     results.sort(key=lambda x: x['similarity'], reverse=True)
+    seen_sources = {}
+    deduplicated = []
+    for res in results:
+        src = res['chunk']['source']
+        if src not in seen_sources:
+            seen_sources[src] = True
+            deduplicated.append(res)
+    return deduplicated[:top_k]
 
-    unique_sources = {}
-    deduplicated_results = []
-    for result in results:
-        if result['chunk']['source'] not in unique_sources:
-            unique_sources[result['chunk']['source']] = True
-            deduplicated_results.append(result)
-
-    return deduplicated_results[:top_k]
-
-# --- Slack Integration & Flask Routes ---
+# --- Format Response ---
 
 def format_citations(chunks):
     if not chunks: return ""
     citations = []
     seen_sources = set()
     for chunk in chunks:
-        source_name = chunk['source']
-        if source_name in seen_sources:
-            continue
-
-        link, meta_info = chunk['link'], chunk.get('meta', {})
-        location = f"page {meta_info['page']}" if 'page' in meta_info else \
-                   f"paragraph {meta_info['paragraph']}" if 'paragraph' in meta_info else \
-                   f"data block {meta_info['block']}" if 'block' in meta_info else "start of document"
+        source = chunk['source']
+        if source in seen_sources: continue
+        meta = chunk.get('meta', {})
+        location = (
+            f"paragraph {meta['paragraph']}" if 'paragraph' in meta else
+            f"page {meta['page']}" if 'page' in meta else
+            f"data block {meta['block']}" if 'block' in meta else
+            "start of document"
+        )
         preview = " ".join(chunk['text'].split()[:10]) + "..."
-        citations.append(f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")')
-        seen_sources.add(source_name)
-
+        citations.append(f'(Source: [{source}]({chunk["link"]}), {location} — starts with: "{preview}")')
+        seen_sources.add(source)
     return "\n\n**Sources:**\n" + "\n".join(citations)
+
+# --- Slack Logic ---
 
 def process_slack_event(channel_id, clean_text):
     refresh_cache_if_needed()
@@ -239,7 +248,6 @@ def process_slack_event(channel_id, clean_text):
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
         relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
-
         if not relevant_results:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
@@ -259,15 +267,14 @@ def process_slack_event(channel_id, clean_text):
 
             context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
-
+            
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
                 if "I cannot answer" in raw_answer:
                     reply = raw_answer
                 else:
-                    citations = format_citations(context_chunks)  # FIXED LINE
-                    reply = raw_answer + citations
+                    reply = raw_answer + format_citations(context_chunks)
             except Exception as e:
                 print(f"Error generating content from Gemini: {e}")
                 reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
@@ -281,19 +288,15 @@ def slack_events():
     data = request.json
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
-
     if request.headers.get('X-Slack-Retry-Num'):
         return Response(status=200)
-
     event = data.get("event", {})
     if event.get("type") == "app_mention":
         channel_id = event.get("channel", "")
         user_text = event.get("text", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
-
         thread = threading.Thread(target=process_slack_event, args=(channel_id, clean_text))
         thread.start()
-
     return Response(status=200)
 
 @app.route("/")
