@@ -74,8 +74,8 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ THE DEFINITIVE FIX V3: This logic is re-engineered to be simple and robust.
-    It reads all non-empty paragraphs into a simple list first, then iterates
+    ✅ THE DEFINITIVE FIX V4: This logic is re-engineered to be simple and robust.
+    It first extracts all non-empty paragraphs into a clean list, then iterates
     through that list to group questions and answers reliably. It uses the
     manually entered numbers from the document for 100% accurate citations.
     """
@@ -84,7 +84,7 @@ def read_google_doc(file_id):
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
-        # First, extract all non-empty paragraphs into a clean list.
+        # Pass 1: Extract all non-empty paragraphs into a clean list.
         # This avoids the complexity of the raw API response structure.
         all_paragraphs = []
         for content_item in doc_content:
@@ -94,7 +94,7 @@ def read_google_doc(file_id):
                 if p_text:
                     all_paragraphs.append(p_text)
 
-        # Now, iterate through the clean list to group Q&A and get correct paragraph numbers.
+        # Pass 2: Iterate through the clean list to group Q&A and get correct paragraph numbers.
         i = 0
         while i < len(all_paragraphs):
             current_p = all_paragraphs[i]
@@ -131,7 +131,7 @@ def read_google_doc(file_id):
             i += 1
             
     except Exception as e:
-        print(f"Error in read_google_doc (V3 LOGIC): {e}")
+        print(f"Error in read_google_doc (V4 LOGIC): {e}")
     return chunks
 
 
@@ -252,7 +252,8 @@ def format_citations(chunks):
         elif 'block' in meta_info:
             location = f"in data block {meta_info['block']}"
         else:
-            location = "near the start of the document"
+            # This is a fallback for non-numbered paragraphs like headings
+            location = "in a relevant section"
         
         preview = " ".join(chunk['text'].split()[:10]) + "..."
         citations.append(f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")')
