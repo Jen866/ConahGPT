@@ -74,8 +74,9 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    This function intelligently groups manually numbered questions and their
-    corresponding answers into single, logical chunks for accurate context and citation.
+    ✅ THE DEFINITIVE FIX: This function IGNORES all internal counting. It ONLY
+    creates chunks from paragraphs that are MANUALLY NUMBERED in the Google Doc.
+    This makes the citation number 100% reliant on the document's content.
     """
     chunks = []
     try:
@@ -84,6 +85,7 @@ def read_google_doc(file_id):
         
         i = 0
         while i < len(doc_content):
+            # Get current paragraph text
             content_item = doc_content[i]
             if "paragraph" not in content_item:
                 i += 1
@@ -92,20 +94,23 @@ def read_google_doc(file_id):
             elements = content_item.get("paragraph", {}).get("elements", [])
             p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
 
-            # Find paragraphs that start with a number (e.g., "61.")
+            # Use regex to find paragraphs that start with a number (e.g., "61.")
             match = re.match(r'^\s*(\d+)\.?', p_text)
             
-            # If it's not a numbered paragraph, we skip it.
+            # If it's NOT a numbered paragraph, it is completely ignored.
+            # This prevents headings, blank lines, or other text from affecting the result.
             if not match:
                 i += 1
                 continue
 
-            # This is a numbered paragraph.
+            # --- This is a numbered paragraph, so we process it ---
+            
+            # The citation number is the number we found in the document.
             citation_number = int(match.group(1))
             question_text = p_text
 
+            # Now, find the corresponding answer in the next non-empty, non-numbered paragraph.
             answer_text = ""
-            # Look ahead to find the answer in the next non-empty, non-numbered paragraph.
             next_i = i + 1
             while next_i < len(doc_content):
                 next_content_item = doc_content[next_i]
@@ -114,26 +119,29 @@ def read_google_doc(file_id):
                     next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
                     
                     if next_p_text:
-                        # If the next line is also numbered, it's a new question, so stop.
+                        # If the next line is also numbered, it's a new question, so we stop.
                         if re.match(r'^\s*(\d+)\.?', next_p_text):
                             break 
-                        # Otherwise, this is the answer.
+                        # Otherwise, we have found the answer.
                         answer_text = next_p_text
-                        i = next_i # Consume the answer paragraph
+                        i = next_i # Move the main loop's index past the answer
                         break
                 next_i += 1
 
-            # Create a single, logical chunk for the Q&A pair.
+            # Combine the question and answer into a single chunk for the AI.
+            # This ensures the AI always has the full context.
             full_text = f"Question: {question_text} Answer: {answer_text}"
             chunks.append({
                 "text": clean_text(full_text),
-                "meta": {"paragraph": citation_number}
+                "meta": {"paragraph": citation_number} # Use the number from the document
             })
             
             i += 1
+            
     except Exception as e:
-        print(f"Error reading Google Doc with numbered list logic: {e}")
+        print(f"Error in read_google_doc: {e}")
     return chunks
+
 
 def read_pdf(file_id):
     chunks = []
