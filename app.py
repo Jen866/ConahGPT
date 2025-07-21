@@ -74,66 +74,33 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ FIX: This function now intelligently groups questions and answers together
-    into a single chunk and uses the question text for citations, which is
-    more robust than paragraph numbers.
+    Reads a Google Doc and chunks it by paragraph, assigning a paragraph number.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
-        i = 0
-        while i < len(doc_content):
-            # Get current paragraph text
-            content_item = doc_content[i]
-            if "paragraph" not in content_item:
-                i += 1
-                continue
-            
-            elements = content_item.get("paragraph", {}).get("elements", [])
-            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+        paragraph_count = 0
+        for content_item in doc_content:
+            if "paragraph" in content_item:
+                elements = content_item.get("paragraph", {}).get("elements", [])
+                p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
 
-            if not p_text:
-                i += 1
-                continue
-
-            # Heuristic: A line ending in '?' is treated as a question.
-            if p_text.endswith('?'):
-                question_text = p_text
-                answer_text = ""
-                
-                # Greedily look ahead for the answer in the next non-question paragraph.
-                if (i + 1) < len(doc_content):
-                    next_content_item = doc_content[i+1]
-                    if "paragraph" in next_content_item:
-                        next_elements = next_content_item.get("paragraph", {}).get("elements", [])
-                        next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
-                        
-                        if next_p_text and not next_p_text.endswith('?'):
-                            answer_text = next_p_text
-                            i += 1 # Consume the answer paragraph as well
-
-                # Create a single, logical chunk for the Q&A pair.
-                full_text = f"Question: {question_text} Answer: {answer_text}"
-                chunks.append({
-                    "text": clean_text(full_text),
-                    "meta": {"question": question_text} # Store the question for citation
-                })
-            else:
-                # If it's not a question, treat it as a standalone content chunk.
-                chunks.append({
-                    "text": clean_text(p_text),
-                    "meta": {"preview": p_text[:80]} # Use a preview for citation
-                })
-            
-            i += 1
+                if p_text: # Only count and add non-empty paragraphs
+                    paragraph_count += 1
+                    chunks.append({
+                        "text": clean_text(p_text),
+                        "meta": {"paragraph": paragraph_count}
+                    })
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
     return chunks
 
-
 def read_pdf(file_id):
+    """
+    Reads a PDF and chunks it by page, assigning a page number.
+    """
     chunks = []
     try:
         request_file = drive_service.files().get_media(fileId=file_id)
@@ -224,7 +191,6 @@ def get_relevant_chunks(question, chunks, top_k=3):
         if similarities[i] > 0.1:
             results.append(chunks[i])
 
-    # Deduplicate by source document, keeping the first one found (most relevant)
     unique_sources = {}
     deduplicated_chunks = []
     for chunk in results:
@@ -238,8 +204,8 @@ def get_relevant_chunks(question, chunks, top_k=3):
 
 def format_citations(chunks):
     """
-    ✅ FIX: This function now creates citations based on the question text,
-    making them more robust and user-friendly.
+    ✅ FINAL FIX: This function now provides the best possible location for each
+    document type: page for PDFs, paragraph for Docs, and block for Sheets.
     """
     if not chunks: return ""
     citations = []
@@ -248,16 +214,18 @@ def format_citations(chunks):
         link = chunk['link']
         meta_info = chunk.get('meta', {})
         
-        if 'question' in meta_info:
-            location = f"under question \"{meta_info['question']}\""
-        elif 'page' in meta_info:
+        # Determine the location type based on available metadata
+        if 'page' in meta_info:
             location = f"on page {meta_info['page']}"
-        elif 'preview' in meta_info:
-            location = f"in a paragraph starting with \"{meta_info['preview']}...\""
+        elif 'paragraph' in meta_info:
+            location = f"in paragraph {meta_info['paragraph']}"
+        elif 'block' in meta_info:
+            location = f"in data block {meta_info['block']}"
         else:
             location = "near the start of the document"
         
-        citations.append(f'(Source: [{source_name}]({link}), {location})')
+        preview = " ".join(chunk['text'].split()[:10]) + "..."
+        citations.append(f'(Source: [{source_name}]({link}), {location} — starts with: "{preview}")')
 
     return "\n\n**Sources:**\n" + "\n".join(citations)
 
@@ -271,7 +239,6 @@ def process_slack_event(channel_id, clean_text):
         if not relevant_chunks:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
-            # ✅ FIX: The context window logic is removed. The new Q&A chunks are sufficient.
             context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
             
