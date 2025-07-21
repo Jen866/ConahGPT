@@ -1,7 +1,6 @@
-# 🚀 FULL CONAH GPT - FAQ PARAGRAPH MATCHING FROM GOOGLE DOC
 import os
 import io
-import fitz
+import fitz  # PyMuPDF
 import gspread
 import json
 import re
@@ -23,7 +22,7 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-# --- Configs & Credentials ---
+# --- Global Configurations & Clients ---
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://spreadsheets.google.com/feeds",
@@ -53,9 +52,8 @@ model = genai.GenerativeModel(
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 SHARED_DRIVE_ID = "0AL5LG1aWrCL2Uk9PVA"
-FAQ_DOC_ID = "YOUR_FILE_ID_HERE"  # ⬅️ Replace this with your real Google Doc ID
 
-# --- Cache ---
+# --- Caching Mechanism ---
 drive_chunks_cache = []
 cache_last_updated = None
 CACHE_DURATION = timedelta(minutes=10)
@@ -64,29 +62,7 @@ cache_lock = Lock()
 def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Extract Paragraph Map from the FAQ Google Doc ---
-def load_paragraph_number_map(file_id):
-    paragraph_map = {}
-    try:
-        doc = docs_service.documents().get(documentId=file_id).execute()
-        content = doc.get("body", {}).get("content", [])
-        count = 1
-        for item in content:
-            if "paragraph" in item:
-                text = "".join([
-                    el.get("textRun", {}).get("content", "")
-                    for el in item.get("paragraph", {}).get("elements", [])
-                ]).strip()
-                if text.endswith("?"):
-                    paragraph_map[text[:60].lower()] = count
-                    count += 1
-    except Exception as e:
-        print(f"Error loading paragraph map from Google Doc: {e}")
-    return paragraph_map
-
-FAQ_PARAGRAPH_MAP = load_paragraph_number_map(FAQ_DOC_ID)
-
-# --- Google File Readers ---
+# --- Google Drive Reading Functions ---
 
 def read_google_sheet(file_id):
     try:
@@ -97,30 +73,65 @@ def read_google_sheet(file_id):
         return ""
 
 def read_google_doc(file_id):
+    """
+    ✅ FIX: This function now intelligently groups questions and answers together
+    into a single chunk and uses the question text for citations, which is
+    more robust than paragraph numbers.
+    """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
-        for item in doc_content:
-            if "paragraph" in item:
-                elements = item.get("paragraph", {}).get("elements", [])
-                full_text = "".join([
-                    el.get("textRun", {}).get("content", "") for el in elements
-                ]).strip()
-                if full_text:
-                    cleaned = clean_text(full_text)
-                    para_num = None
-                    for q_text, number in FAQ_PARAGRAPH_MAP.items():
-                        if cleaned.lower().startswith(q_text):
-                            para_num = number
-                            break
-                    chunks.append({
-                        "text": cleaned,
-                        "meta": {"paragraph": para_num} if para_num else {}
-                    })
+        
+        i = 0
+        while i < len(doc_content):
+            # Get current paragraph text
+            content_item = doc_content[i]
+            if "paragraph" not in content_item:
+                i += 1
+                continue
+            
+            elements = content_item.get("paragraph", {}).get("elements", [])
+            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+
+            if not p_text:
+                i += 1
+                continue
+
+            # Heuristic: A line ending in '?' is treated as a question.
+            if p_text.endswith('?'):
+                question_text = p_text
+                answer_text = ""
+                
+                # Greedily look ahead for the answer in the next non-question paragraph.
+                if (i + 1) < len(doc_content):
+                    next_content_item = doc_content[i+1]
+                    if "paragraph" in next_content_item:
+                        next_elements = next_content_item.get("paragraph", {}).get("elements", [])
+                        next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
+                        
+                        if next_p_text and not next_p_text.endswith('?'):
+                            answer_text = next_p_text
+                            i += 1 # Consume the answer paragraph as well
+
+                # Create a single, logical chunk for the Q&A pair.
+                full_text = f"Question: {question_text} Answer: {answer_text}"
+                chunks.append({
+                    "text": clean_text(full_text),
+                    "meta": {"question": question_text} # Store the question for citation
+                })
+            else:
+                # If it's not a question, treat it as a standalone content chunk.
+                chunks.append({
+                    "text": clean_text(p_text),
+                    "meta": {"preview": p_text[:80]} # Use a preview for citation
+                })
+            
+            i += 1
     except Exception as e:
         print(f"Error reading Google Doc {file_id}: {e}")
     return chunks
+
 
 def read_pdf(file_id):
     chunks = []
@@ -144,7 +155,7 @@ def read_pdf(file_id):
         print(f"Error reading PDF {file_id}: {e}")
     return chunks
 
-# --- Content Aggregator ---
+# --- Content Processing and Caching ---
 
 def extract_all_chunks(shared_drive_id):
     print("Refreshing Drive cache...")
@@ -193,7 +204,7 @@ def refresh_cache_if_needed():
             drive_chunks_cache = extract_all_chunks(SHARED_DRIVE_ID)
             cache_last_updated = datetime.utcnow()
 
-# --- Core RAG Matching ---
+# --- RAG Core Logic ---
 
 def get_relevant_chunks(question, chunks, top_k=3):
     if not chunks: return []
@@ -207,81 +218,74 @@ def get_relevant_chunks(question, chunks, top_k=3):
 
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     top_indices = similarities.argsort()[-top_k * 2:][::-1]
-
+    
     results = []
     for i in top_indices:
         if similarities[i] > 0.1:
-            results.append({
-                "chunk": chunks[i],
-                "index": i,
-                "similarity": similarities[i]
-            })
+            results.append(chunks[i])
 
-    results.sort(key=lambda x: x['similarity'], reverse=True)
-    seen_sources = {}
-    deduped = []
-    for res in results:
-        src = res['chunk']['source']
-        if src not in seen_sources:
-            seen_sources[src] = True
-            deduped.append(res)
-    return deduped[:top_k]
+    # Deduplicate by source document, keeping the first one found (most relevant)
+    unique_sources = {}
+    deduplicated_chunks = []
+    for chunk in results:
+        if chunk['source'] not in unique_sources:
+            unique_sources[chunk['source']] = True
+            deduplicated_chunks.append(chunk)
+            
+    return deduplicated_chunks[:top_k]
+
+# --- Slack Integration & Flask Routes ---
 
 def format_citations(chunks):
+    """
+    ✅ FIX: This function now creates citations based on the question text,
+    making them more robust and user-friendly.
+    """
     if not chunks: return ""
     citations = []
-    seen = set()
     for chunk in chunks:
-        source = chunk['source']
-        if source in seen: continue
-        meta = chunk.get('meta', {})
-        location = (
-            f"paragraph {meta['paragraph']}" if 'paragraph' in meta else
-            f"page {meta['page']}" if 'page' in meta else
-            f"block {meta['block']}" if 'block' in meta else "start of document"
-        )
-        snippet = " ".join(chunk['text'].split()[:10]) + "..."
-        citations.append(f"(Source: [{source}]({chunk['link']}), {location} — starts with: \"{snippet}\")")
-        seen.add(source)
-    return "\n\n**Sources:**\n" + "\n".join(citations)
+        source_name = chunk['source']
+        link = chunk['link']
+        meta_info = chunk.get('meta', {})
+        
+        if 'question' in meta_info:
+            location = f"under question \"{meta_info['question']}\""
+        elif 'page' in meta_info:
+            location = f"on page {meta_info['page']}"
+        elif 'preview' in meta_info:
+            location = f"in a paragraph starting with \"{meta_info['preview']}...\""
+        else:
+            location = "near the start of the document"
+        
+        citations.append(f'(Source: [{source_name}]({link}), {location})')
 
-# --- Slack Bot Handler ---
+    return "\n\n**Sources:**\n" + "\n".join(citations)
 
 def process_slack_event(channel_id, clean_text):
     refresh_cache_if_needed()
     if not drive_chunks_cache:
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
-        relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
-        if not relevant_results:
+        relevant_chunks = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
+        
+        if not relevant_chunks:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
-            context_chunks = []
-            indices_added = set()
-            relevant_results.sort(key=lambda x: x['index'])
-
-            for result in relevant_results:
-                original_index = result['index']
-                original_source = result['chunk']['source']
-                for i in range(original_index - 1, original_index + 2):
-                    if 0 <= i < len(drive_chunks_cache) and i not in indices_added:
-                        potential_chunk = drive_chunks_cache[i]
-                        if potential_chunk['source'] == original_source:
-                            context_chunks.append(potential_chunk)
-                            indices_added.add(i)
-
-            context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
+            # ✅ FIX: The context window logic is removed. The new Q&A chunks are sufficient.
+            context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
+            
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
                 if "I cannot answer" in raw_answer:
                     reply = raw_answer
                 else:
-                    reply = raw_answer + format_citations(context_chunks)
+                    citations = format_citations(relevant_chunks)
+                    reply = raw_answer + citations
             except Exception as e:
-                print(f"Gemini error: {e}")
-                reply = f"⚠️ Error generating answer: {str(e)}"
+                print(f"Error generating content from Gemini: {e}")
+                reply = f"⚠️ An error occurred while generating the answer: {str(e)}"
     try:
         slack_client.chat_postMessage(channel=channel_id, text=reply)
     except SlackApiError as e:
@@ -292,15 +296,19 @@ def slack_events():
     data = request.json
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
+    
     if request.headers.get('X-Slack-Retry-Num'):
         return Response(status=200)
+
     event = data.get("event", {})
     if event.get("type") == "app_mention":
         channel_id = event.get("channel", "")
         user_text = event.get("text", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
+        
         thread = threading.Thread(target=process_slack_event, args=(channel_id, clean_text))
         thread.start()
+
     return Response(status=200)
 
 @app.route("/")
