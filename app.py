@@ -77,9 +77,6 @@ def read_google_sheet(file_id):
         return ""
 
 def read_google_doc(file_id):
-    """
-    Reads a Google Doc, extracting manually numbered paragraphs where available.
-    """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
@@ -91,22 +88,16 @@ def read_google_doc(file_id):
                 current_paragraph_text = "".join(
                     [elem.get("textRun", {}).get("content", "") for elem in elements]
                 )
-                
                 cleaned_text = current_paragraph_text.strip()
                 if cleaned_text:
                     fallback_paragraph_index += 1
                     paragraph_number = fallback_paragraph_index
-                    
-                    # ✅ FIX: Look for an explicit number at the start of the paragraph
                     match = re.match(r'^\s*(\d+)\.?', cleaned_text)
                     if match:
-                        # If a number is found, use it as the paragraph number
                         paragraph_number = int(match.group(1))
-                        # Remove the number from the text itself
                         text_for_chunk = cleaned_text[match.end():].strip()
                     else:
                         text_for_chunk = cleaned_text
-                        
                     chunks.append({
                         "text": clean_text(text_for_chunk),
                         "meta": {"paragraph": paragraph_number}
@@ -200,7 +191,7 @@ def get_relevant_chunks(question, chunks, top_k=3):
 
     similarities = cosine_similarity(question_vector, doc_vectors).flatten()
     top_indices = similarities.argsort()[-top_k * 2:][::-1]
-    
+
     results = []
     for i in top_indices:
         if similarities[i] > 0.1:
@@ -211,14 +202,14 @@ def get_relevant_chunks(question, chunks, top_k=3):
             })
 
     results.sort(key=lambda x: x['similarity'], reverse=True)
-    
+
     unique_sources = {}
     deduplicated_results = []
     for result in results:
         if result['chunk']['source'] not in unique_sources:
             unique_sources[result['chunk']['source']] = True
             deduplicated_results.append(result)
-            
+
     return deduplicated_results[:top_k]
 
 # --- Slack Integration & Flask Routes ---
@@ -231,7 +222,7 @@ def format_citations(chunks):
         source_name = chunk['source']
         if source_name in seen_sources:
             continue
-        
+
         link, meta_info = chunk['link'], chunk.get('meta', {})
         location = f"page {meta_info['page']}" if 'page' in meta_info else \
                    f"paragraph {meta_info['paragraph']}" if 'paragraph' in meta_info else \
@@ -248,7 +239,7 @@ def process_slack_event(channel_id, clean_text):
         reply = "I couldn’t read any usable files from Google Drive. Please check folder permissions or content."
     else:
         relevant_results = get_relevant_chunks(clean_text, drive_chunks_cache, top_k=3)
-        
+
         if not relevant_results:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
@@ -268,14 +259,14 @@ def process_slack_event(channel_id, clean_text):
 
             context = "\n\n".join([f"Source Document: {chunk['source']}\nContent: {chunk['text']}" for chunk in context_chunks])
             prompt = f"Based on the following CONTEXT, please provide a direct answer to the USER QUESTION.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}\n\nANSWER:"
-            
+
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, 'text', "I'm sorry, I couldn't generate a response.")
                 if "I cannot answer" in raw_answer:
                     reply = raw_answer
                 else:
-                    citations = format_citations([res['chunk'] for res in relevant_results])
+                    citations = format_citations(context_chunks)  # FIXED LINE
                     reply = raw_answer + citations
             except Exception as e:
                 print(f"Error generating content from Gemini: {e}")
@@ -290,7 +281,7 @@ def slack_events():
     data = request.json
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
-    
+
     if request.headers.get('X-Slack-Retry-Num'):
         return Response(status=200)
 
@@ -299,7 +290,7 @@ def slack_events():
         channel_id = event.get("channel", "")
         user_text = event.get("text", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
-        
+
         thread = threading.Thread(target=process_slack_event, args=(channel_id, clean_text))
         thread.start()
 
