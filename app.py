@@ -74,72 +74,64 @@ def read_google_sheet(file_id):
 
 def read_google_doc(file_id):
     """
-    ✅ THE DEFINITIVE FIX: This function IGNORES all internal counting. It ONLY
-    creates chunks from paragraphs that are MANUALLY NUMBERED in the Google Doc.
-    This makes the citation number 100% reliant on the document's content.
+    ✅ THE DEFINITIVE FIX V3: This logic is re-engineered to be simple and robust.
+    It reads all non-empty paragraphs into a simple list first, then iterates
+    through that list to group questions and answers reliably. It uses the
+    manually entered numbers from the document for 100% accurate citations.
     """
     chunks = []
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
         doc_content = doc.get("body", {}).get("content", [])
         
+        # First, extract all non-empty paragraphs into a clean list.
+        # This avoids the complexity of the raw API response structure.
+        all_paragraphs = []
+        for content_item in doc_content:
+            if "paragraph" in content_item:
+                elements = content_item.get("paragraph", {}).get("elements", [])
+                p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
+                if p_text:
+                    all_paragraphs.append(p_text)
+
+        # Now, iterate through the clean list to group Q&A and get correct paragraph numbers.
         i = 0
-        while i < len(doc_content):
-            # Get current paragraph text
-            content_item = doc_content[i]
-            if "paragraph" not in content_item:
-                i += 1
-                continue
+        while i < len(all_paragraphs):
+            current_p = all_paragraphs[i]
             
-            elements = content_item.get("paragraph", {}).get("elements", [])
-            p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in elements]).strip()
-
-            # Use regex to find paragraphs that start with a number (e.g., "61.")
-            match = re.match(r'^\s*(\d+)\.?', p_text)
-            
-            # If it's NOT a numbered paragraph, it is completely ignored.
-            # This prevents headings, blank lines, or other text from affecting the result.
-            if not match:
-                i += 1
-                continue
-
-            # --- This is a numbered paragraph, so we process it ---
-            
-            # The citation number is the number we found in the document.
-            citation_number = int(match.group(1))
-            question_text = p_text
-
-            # Now, find the corresponding answer in the next non-empty, non-numbered paragraph.
-            answer_text = ""
-            next_i = i + 1
-            while next_i < len(doc_content):
-                next_content_item = doc_content[next_i]
-                if "paragraph" in next_content_item:
-                    next_elements = next_content_item.get("paragraph", {}).get("elements", [])
-                    next_p_text = "".join([elem.get("textRun", {}).get("content", "") for elem in next_elements]).strip()
-                    
-                    if next_p_text:
-                        # If the next line is also numbered, it's a new question, so we stop.
-                        if re.match(r'^\s*(\d+)\.?', next_p_text):
-                            break 
-                        # Otherwise, we have found the answer.
-                        answer_text = next_p_text
-                        i = next_i # Move the main loop's index past the answer
-                        break
-                next_i += 1
-
-            # Combine the question and answer into a single chunk for the AI.
-            # This ensures the AI always has the full context.
-            full_text = f"Question: {question_text} Answer: {answer_text}"
-            chunks.append({
-                "text": clean_text(full_text),
-                "meta": {"paragraph": citation_number} # Use the number from the document
-            })
+            # Check if the current paragraph is a numbered question.
+            match = re.match(r'^\s*(\d+)\.?', current_p)
+            if match:
+                citation_number = int(match.group(1))
+                question_text = current_p
+                answer_text = ""
+                
+                # Look at the next paragraph in the list to see if it's the answer.
+                if (i + 1) < len(all_paragraphs):
+                    next_p = all_paragraphs[i+1]
+                    # The answer is the next line, as long as it's not another numbered question.
+                    if not re.match(r'^\s*(\d+)\.?', next_p):
+                        answer_text = next_p
+                        i += 1 # Consume the answer paragraph so it's not processed twice.
+                
+                # Create the combined chunk for full context.
+                full_text = f"Question: {question_text} Answer: {answer_text}"
+                chunks.append({
+                    "text": clean_text(full_text),
+                    "meta": {"paragraph": citation_number}
+                })
+            else:
+                # This is a standalone paragraph (e.g., a heading).
+                # We still include it as a chunk for context, but without a specific number.
+                chunks.append({
+                    "text": clean_text(current_p),
+                    "meta": {} 
+                })
             
             i += 1
             
     except Exception as e:
-        print(f"Error in read_google_doc: {e}")
+        print(f"Error in read_google_doc (V3 LOGIC): {e}")
     return chunks
 
 
