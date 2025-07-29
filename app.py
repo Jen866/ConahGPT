@@ -12,6 +12,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -31,6 +32,7 @@ gspread_client = gspread.authorize(creds)
 drive_service = build('drive', 'v3', credentials=creds)
 docs_service = build('docs', 'v1', credentials=creds)
 
+# Gemini setup
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     model_name="models/gemini-1.5-pro",
@@ -38,7 +40,7 @@ model = genai.GenerativeModel(
     You are Conah GPT, a precise business assistant for Actuary Consulting.
     Fully answer each question clearly based on the provided CONTEXT.
     Only respond once per question. Include source citations at the end:
-    (Source: [Document Name], paragraph 5 — starts with: \"Preview snippet...\")
+    (Source: [Document Name], paragraph 5 — starts with: "Preview snippet...")
     If source is a PDF, show page number instead of paragraph.
     If answer is not available, say:
     'I cannot answer this question as the information is not in the provided documents.'
@@ -47,18 +49,20 @@ model = genai.GenerativeModel(
 
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-
+# PDF cleanup
 def clean_pdf_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-def get_all_file_ids_recursive(folder_id):
-    files = []
+# Recursive folder fetcher
+def get_all_files_recursive(folder_id):
+    all_files = []
+    query = f"'{folder_id}' in parents and trashed = false"
     page_token = None
     while True:
         response = drive_service.files().list(
-            q=f"'{folder_id}' in parents and trashed = false",
+            q=query,
             corpora="drive",
-            driveId="0AL5LG1aWrCL2Uk9PVA",
+            driveId=SHARED_DRIVE_ID,
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
             fields="nextPageToken, files(id, name, mimeType)",
@@ -67,14 +71,14 @@ def get_all_file_ids_recursive(folder_id):
 
         for file in response.get('files', []):
             if file['mimeType'] == 'application/vnd.google-apps.folder':
-                files += get_all_file_ids_recursive(file['id'])
+                all_files.extend(get_all_files_recursive(file['id']))
             else:
-                files.append(file)
+                all_files.append(file)
 
         page_token = response.get('nextPageToken', None)
         if page_token is None:
             break
-    return files
+    return all_files
 
 def read_google_sheet(file_id):
     try:
@@ -123,26 +127,35 @@ def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-def get_relevant_chunks(question, files, top_k=5):
+def get_top_file_matches(question, files, top_k=5):
+    titles = [file['name'] for file in files]
+    vectorizer = TfidfVectorizer().fit(titles + [question])
+    vectors = vectorizer.transform(titles + [question])
+    scores = cosine_similarity(vectors[-1], vectors[:-1]).flatten()
+    top_indices = scores.argsort()[-top_k:][::-1]
+    return [files[i] for i in top_indices if scores[i] > 0.05]
+
+def extract_relevant_chunks(shared_drive_id, question):
+    all_files = get_all_files_recursive(shared_drive_id)
+    top_files = get_top_file_matches(question, all_files, top_k=5)
     chunks = []
-    for file in files:
+    for file in top_files:
         file_id, name, mime_type = file['id'], file['name'], file['mimeType']
         doc_link = f"https://drive.google.com/file/d/{file_id}"
-        content_chunks = []
         if mime_type == 'application/vnd.google-apps.spreadsheet':
             content = read_google_sheet(file_id)
             for i, chunk in enumerate(chunk_text(content)):
-                content_chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"row {i+1}"})
+                chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"row {i+1}"})
         elif mime_type == 'application/vnd.google-apps.document':
             for para_num, para in read_google_doc(file_id):
-                content_chunks.append({"text": para, "source": name, "link": doc_link, "meta": f"paragraph {para_num}"})
+                chunks.append({"text": para, "source": name, "link": doc_link, "meta": f"paragraph {para_num}"})
         elif mime_type == 'application/pdf':
             for page_num, text in read_pdf(file_id):
                 for i, chunk in enumerate(chunk_text(text)):
-                    content_chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"page {page_num}"})
+                    chunks.append({"text": chunk, "source": name, "link": doc_link, "meta": f"page {page_num}"})
+    return chunks
 
-        chunks.extend(content_chunks)
-
+def get_relevant_chunks(question, chunks, top_k=5):
     documents = [chunk["text"] for chunk in chunks]
     vectorizer = TfidfVectorizer().fit(documents + [question])
     doc_vectors = vectorizer.transform(documents)
@@ -169,20 +182,20 @@ def slack_events():
         channel_id = data["event"].get("channel", "")
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
-        all_files = get_all_file_ids_recursive("0AL5LG1aWrCL2Uk9PVA")
-        relevant_chunks = get_relevant_chunks(clean_text, all_files)
+        shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
+        chunks = extract_relevant_chunks(shared_drive_id, clean_text)
 
-        if not relevant_chunks:
+        if not chunks:
             reply = "I cannot answer this question as the information is not in the provided documents."
         else:
-            context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
+            context = "\n\n".join([chunk["text"] for chunk in chunks])
             prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{clean_text}"
             try:
                 gemini_response = model.generate_content(prompt)
                 raw_answer = getattr(gemini_response, "text", "Oops, no answer returned.")
                 citations = []
                 seen = set()
-                for chunk in relevant_chunks:
+                for chunk in chunks:
                     key = chunk['link'] + chunk['meta']
                     if key not in seen:
                         seen.add(key)
