@@ -12,7 +12,6 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -53,18 +52,33 @@ slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 def clean_pdf_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
-# File Readers
-def list_all_files_in_shared_drive(shared_drive_id):
-    results = drive_service.files().list(
-        q="mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet' or mimeType='application/pdf'",
-        corpora="drive",
-        driveId=shared_drive_id,
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-        fields="files(id, name, mimeType)"
-    ).execute()
-    return results.get('files', [])
+# Recursive file listing
+def recursively_list_files_in_drive(folder_id):
+    all_files = []
+    folders_to_check = [folder_id]
 
+    while folders_to_check:
+        current_folder = folders_to_check.pop()
+        try:
+            results = drive_service.files().list(
+                q=f"'{current_folder}' in parents and trashed = false",
+                corpora="drive",
+                driveId=folder_id,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields="files(id, name, mimeType)"
+            ).execute()
+
+            for item in results.get("files", []):
+                if item["mimeType"] == "application/vnd.google-apps.folder":
+                    folders_to_check.append(item["id"])
+                else:
+                    all_files.append(item)
+        except Exception as e:
+            print(f"Error retrieving files from folder {current_folder}: {e}")
+    return all_files
+
+# File Readers
 def read_google_sheet(file_id):
     try:
         sheet = gspread_client.open_by_key(file_id).sheet1
@@ -114,7 +128,7 @@ def chunk_text(text, chunk_size=300):
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
 def extract_all_chunks(shared_drive_id):
-    files = list_all_files_in_shared_drive(shared_drive_id)
+    files = recursively_list_files_in_drive(shared_drive_id)
     chunks = []
     for file in files:
         file_id, name, mime_type = file['id'], file['name'], file['mimeType']
