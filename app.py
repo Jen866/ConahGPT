@@ -206,7 +206,7 @@ def extract_all_chunks_uncached(shared_drive_id):
 
         elif mime == "application/pdf":
             for page_text, page_no in read_pdf_pages(file_id):
-                for piece in chunk_text(page_text)):
+                for piece in chunk_text(page_text):
                     chunks.append({
                         "text": piece,
                         "source": name,
