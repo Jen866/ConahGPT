@@ -72,26 +72,61 @@ def chunk_text(text, chunk_size=CHUNK_SIZE):
 
 # ---- Readers that preserve page/paragraph positions ----
 def read_google_doc_paragraphs(file_id):
-    """Return list of (paragraph_text, paragraph_index starting at 1)."""
+    """
+    Return list of (paragraph_text, paragraph_index starting at 1).
+    We STITCH short/heading/question paragraphs with the next one(s),
+    so 'Do I pay for Affidavits?' + 'No' becomes a single block for retrieval.
+    """
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
-        out = []
-        p_idx = 0
+
+        # 1) Collect raw paragraphs
+        raw_paras = []
         for content in doc.get("body", {}).get("content", []):
             para = content.get("paragraph")
             if not para:
                 continue
-            pieces = []
+            parts = []
             for el in para.get("elements", []):
                 tr = el.get("textRun", {})
-                pieces.append(tr.get("content", ""))
-            p_text = clean_ws("".join(pieces))
-            if not p_text:
-                continue
+                parts.append(tr.get("content", ""))
+            txt = clean_ws("".join(parts))
+            if txt:
+                raw_paras.append(txt[:MAX_CHARS_PER_FILE])
+
+        # 2) Stitch short/question/headers with following answers
+        stitched = []
+        i = 0
+        p_idx = 0
+        while i < len(raw_paras):
+            cur = raw_paras[i]
+            looks_short = len(cur.split()) < 8
+            looks_q = cur.endswith("?")
+            looks_header = bool(re.match(r"^([A-Z][A-Z \-:0-9/]{2,}|[•\-\u2022])", cur))
+
+            block = cur
+            first_index = i + 1  # 1-based index for the citation
+            j = i + 1
+
+            if looks_short or looks_q or looks_header:
+                pulls = 0
+                while j < len(raw_paras) and pulls < 2:
+                    nxt = raw_paras[j]
+                    # stop if next is screaming header
+                    if len(nxt.split()) >= 30 and nxt.isupper():
+                        break
+                    block = (block + " " + nxt).strip()
+                    pulls += 1
+                    j += 1
+                i = j
+            else:
+                i += 1
+
             p_idx += 1
-            # truncate long paragraphs to cap memory
-            out.append((p_text[:MAX_CHARS_PER_FILE], p_idx))
-        return out
+            stitched.append((block, first_index))
+
+        return stitched
+
     except Exception:
         return []
 
@@ -171,7 +206,7 @@ def extract_all_chunks_uncached(shared_drive_id):
 
         elif mime == "application/pdf":
             for page_text, page_no in read_pdf_pages(file_id):
-                for piece in chunk_text(page_text):
+                for piece in chunk_text(page_text)):
                     chunks.append({
                         "text": piece,
                         "source": name,
