@@ -21,13 +21,14 @@ app = Flask(__name__)
 CORS(app)
 
 # -------------------- Tunables / Memory Caps --------------------
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))      # 10 minutes
-MAX_FILES = int(os.getenv("MAX_FILES", "25"))                       # cap total files read
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))                # first N pages per PDF
-MAX_CHARS_PER_FILE = int(os.getenv("MAX_CHARS_PER_FILE", "60000"))  # truncate long docs
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "240"))                    # words per chunk
-TFIDF_MAX_FEATURES = int(os.getenv("TFIDF_MAX_FEATURES", "15000"))  # vectorizer cap
-TOP_K = int(os.getenv("TOP_K", "3"))                                # relevant chunks
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))       # 10 minutes
+MAX_FILES = int(os.getenv("MAX_FILES", "20"))                        # cap total files opened
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "6"))                 # first N pages per PDF
+MAX_CHARS_PER_FILE = int(os.getenv("MAX_CHARS_PER_FILE", "40000"))   # truncate per file
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "240"))                     # words per chunk
+TFIDF_MAX_FEATURES = int(os.getenv("TFIDF_MAX_FEATURES", "5000"))    # small vocabulary
+TOP_K = int(os.getenv("TOP_K", "3"))                                 # final relevant chunks
+PREFILTER_CHUNKS = int(os.getenv("PREFILTER_CHUNKS", "400"))         # cap before TF-IDF
 
 CHUNK_CACHE = {"data": None, "ts": 0}
 
@@ -38,7 +39,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents.readonly",
 ]
-
 SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(
     json.loads(SERVICE_ACCOUNT_JSON), SCOPES
@@ -62,9 +62,12 @@ Return the answer ONCE, in a single concise paragraph (no bullets, no repetition
 # -------------------- Slack --------------------
 slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-# -------------------- Helpers --------------------
+# -------------------- Utilities --------------------
 def clean_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+def words_set(s: str):
+    return set(w for w in re.findall(r"[A-Za-z0-9']+", s.lower()) if len(w) >= 3)
 
 def chunk_text(text, chunk_size=CHUNK_SIZE):
     words = text.split()
@@ -74,13 +77,11 @@ def chunk_text(text, chunk_size=CHUNK_SIZE):
 def read_google_doc_paragraphs(file_id):
     """
     Return list of (paragraph_text, paragraph_index starting at 1).
-    We STITCH short/heading/question paragraphs with the next one(s),
-    so 'Do I pay for Affidavits?' + 'No' becomes a single block for retrieval.
+    STITCH short/heading/question paragraphs with the next one(s)
+    so 'Do I pay for Affidavits?' + 'No' becomes a single block.
     """
     try:
         doc = docs_service.documents().get(documentId=file_id).execute()
-
-        # 1) Collect raw paragraphs
         raw_paras = []
         for content in doc.get("body", {}).get("content", []):
             para = content.get("paragraph")
@@ -94,7 +95,6 @@ def read_google_doc_paragraphs(file_id):
             if txt:
                 raw_paras.append(txt[:MAX_CHARS_PER_FILE])
 
-        # 2) Stitch short/question/headers with following answers
         stitched = []
         i = 0
         p_idx = 0
@@ -103,16 +103,13 @@ def read_google_doc_paragraphs(file_id):
             looks_short = len(cur.split()) < 8
             looks_q = cur.endswith("?")
             looks_header = bool(re.match(r"^([A-Z][A-Z \-:0-9/]{2,}|[•\-\u2022])", cur))
-
             block = cur
-            first_index = i + 1  # 1-based index for the citation
+            first_index = i + 1
             j = i + 1
-
             if looks_short or looks_q or looks_header:
                 pulls = 0
                 while j < len(raw_paras) and pulls < 2:
                     nxt = raw_paras[j]
-                    # stop if next is screaming header
                     if len(nxt.split()) >= 30 and nxt.isupper():
                         break
                     block = (block + " " + nxt).strip()
@@ -121,12 +118,9 @@ def read_google_doc_paragraphs(file_id):
                 i = j
             else:
                 i += 1
-
             p_idx += 1
             stitched.append((block, first_index))
-
         return stitched
-
     except Exception:
         return []
 
@@ -160,7 +154,7 @@ def read_pdf_pages(file_id):
     except Exception:
         return []
 
-# ---- Ingest to chunks with metadata ----
+# ---- Drive listing with filename prefilter ----
 def list_files(shared_drive_id):
     results = drive_service.files().list(
         q="mimeType='application/vnd.google-apps.document' "
@@ -172,10 +166,25 @@ def list_files(shared_drive_id):
         supportsAllDrives=True,
         fields="files(id, name, mimeType)"
     ).execute()
-    return results.get("files", [])[:MAX_FILES]
+    return results.get("files", [])
 
-def extract_all_chunks_uncached(shared_drive_id):
+def list_files_prefilter(shared_drive_id, question_words):
     files = list_files(shared_drive_id)
+    if not files:
+        return []
+    # keep files whose name overlaps with the question words
+    def score(f):
+        name_words = words_set(f["name"])
+        return len(name_words & question_words)
+    # score and sort; keep top MAX_FILES; if all zero, just take first MAX_FILES
+    files_scored = sorted(files, key=score, reverse=True)
+    if all(score(f) == 0 for f in files_scored):
+        return files_scored[:MAX_FILES]
+    return files_scored[:MAX_FILES]
+
+def extract_all_chunks_uncached(shared_drive_id, question: str):
+    q_words = words_set(question)
+    files = list_files_prefilter(shared_drive_id, q_words)
     chunks = []
     for f in files:
         file_id, name, mime = f["id"], f["name"], f["mimeType"]
@@ -206,7 +215,7 @@ def extract_all_chunks_uncached(shared_drive_id):
 
         elif mime == "application/pdf":
             for page_text, page_no in read_pdf_pages(file_id):
-                for piece in chunk_text(page_text):
+                for piece in chunk_text(page_text)):
                     chunks.append({
                         "text": piece,
                         "source": name,
@@ -217,10 +226,11 @@ def extract_all_chunks_uncached(shared_drive_id):
 
     return chunks
 
-def get_chunks(shared_drive_id):
+def get_chunks(shared_drive_id, question):
     now = time.time()
+    # cache is independent of question (we keep it simple/fast)
     if CHUNK_CACHE["data"] is None or now - CHUNK_CACHE["ts"] > CACHE_TTL_SECONDS:
-        CHUNK_CACHE["data"] = extract_all_chunks_uncached(shared_drive_id)
+        CHUNK_CACHE["data"] = extract_all_chunks_uncached(shared_drive_id, question)
         CHUNK_CACHE["ts"] = now
     return CHUNK_CACHE["data"]
 
@@ -234,17 +244,36 @@ def deduplicate_chunks(chunks):
             seen.add(key)
     return unique
 
+# ---- Lightweight prefilter before TF-IDF ----
+def prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS):
+    if not chunks:
+        return []
+    q_words = words_set(question)
+    def score(c):
+        c_words = words_set(c["text"])
+        return len(c_words & q_words)
+    ranked = sorted(chunks, key=score, reverse=True)
+    # if all scores are 0, just keep the first n to limit memory
+    if all(score(c) == 0 for c in ranked):
+        return ranked[:min(n, len(ranked))]
+    return ranked[:min(n, len(ranked))]
+
 def get_relevant_chunks(question, chunks, top_k=TOP_K):
     if not chunks:
         return []
+    # dedup and prefilter
     chunks = deduplicate_chunks(chunks)
-    docs = [c["text"] for c in chunks]
+    small = prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS)
+    if not small:
+        return []
+    docs = [c["text"] for c in small]
+    # small TF-IDF to choose final top_k
     vectorizer = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words="english").fit(docs + [question])
     doc_vectors = vectorizer.transform(docs)
     q_vec = vectorizer.transform([question])
     sims = cosine_similarity(q_vec, doc_vectors).flatten()
     top_idx = sims.argsort()[-top_k:][::-1]
-    return [chunks[i] for i in top_idx if sims[i] > 0.05]
+    return [small[i] for i in top_idx if sims[i] > 0.05]
 
 def keep_single_paragraph(answer_text: str) -> str:
     """Keep only the first meaningful paragraph (>=5 words)."""
@@ -291,7 +320,7 @@ def slack_events():
         clean_text = re.sub(r"<@[^>]+>", "", user_text).strip()
 
         shared_drive_id = "0AL5LG1aWrCL2Uk9PVA"
-        all_chunks = get_chunks(shared_drive_id)
+        all_chunks = get_chunks(shared_drive_id, clean_text)
 
         if not all_chunks:
             reply = "I couldn’t read any usable files from Google Drive. Please check the folder."
