@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import HashingVectorizer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -26,9 +27,8 @@ MAX_FILES = int(os.getenv("MAX_FILES", "20"))                        # cap total
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "6"))                 # first N pages per PDF
 MAX_CHARS_PER_FILE = int(os.getenv("MAX_CHARS_PER_FILE", "40000"))   # truncate per file
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "240"))                     # words per chunk
-TFIDF_MAX_FEATURES = int(os.getenv("TFIDF_MAX_FEATURES", "5000"))    # small vocabulary
 TOP_K = int(os.getenv("TOP_K", "3"))                                 # final relevant chunks
-PREFILTER_CHUNKS = int(os.getenv("PREFILTER_CHUNKS", "400"))         # cap before TF-IDF
+PREFILTER_CHUNKS = int(os.getenv("PREFILTER_CHUNKS", "150"))         # cap before vectorizing
 
 CHUNK_CACHE = {"data": None, "ts": 0}
 
@@ -213,7 +213,7 @@ def extract_all_chunks_uncached(shared_drive_id, question: str):
 
         elif mime == "application/pdf":
             for page_text, page_no in read_pdf_pages(file_id):
-                for piece in chunk_text(page_text):   # <-- fixed: no extra ')'
+                for piece in chunk_text(page_text):
                     chunks.append({
                         "text": piece,
                         "source": name,
@@ -226,7 +226,6 @@ def extract_all_chunks_uncached(shared_drive_id, question: str):
 
 def get_chunks(shared_drive_id, question):
     now = time.time()
-    # simple TTL cache; rebuilt periodically
     if CHUNK_CACHE["data"] is None or now - CHUNK_CACHE["ts"] > CACHE_TTL_SECONDS:
         CHUNK_CACHE["data"] = extract_all_chunks_uncached(shared_drive_id, question)
         CHUNK_CACHE["ts"] = now
@@ -242,7 +241,7 @@ def deduplicate_chunks(chunks):
             seen.add(key)
     return unique
 
-# ---- Lightweight prefilter before TF-IDF ----
+# ---- Lightweight prefilter before vectorizing ----
 def prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS):
     if not chunks:
         return []
@@ -255,6 +254,7 @@ def prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS):
         return ranked[:min(n, len(ranked))]
     return ranked[:min(n, len(ranked))]
 
+# ---- Memory-safe retrieval using HashingVectorizer ----
 def get_relevant_chunks(question, chunks, top_k=TOP_K):
     if not chunks:
         return []
@@ -263,13 +263,22 @@ def get_relevant_chunks(question, chunks, top_k=TOP_K):
     if not small:
         return []
     docs = [c["text"] for c in small]
-    vectorizer = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words="english").fit(docs + [question])
-    doc_vectors = vectorizer.transform(docs)
-    q_vec = vectorizer.transform([question])
+
+    hv = HashingVectorizer(
+        n_features=2**16,        # 65,536 dims
+        alternate_sign=False,
+        norm="l2",
+        stop_words="english",
+        lowercase=True,
+    )
+
+    doc_vectors = hv.transform(docs)
+    q_vec = hv.transform([question])
     sims = cosine_similarity(q_vec, doc_vectors).flatten()
     top_idx = sims.argsort()[-top_k:][::-1]
-    return [small[i] for i in top_idx if sims[i] > 0.05]
+    return [small[i] for i in top_idx if sims[i] > 0.02]
 
+# ---- Output formatting ----
 def keep_single_paragraph(answer_text: str) -> str:
     """Keep only the first meaningful paragraph (>=5 words)."""
     if not answer_text:
@@ -289,7 +298,7 @@ def format_citations(relevant_chunks):
     seen = set()
     lines = []
     for c in relevant_chunks:
-        key = (c["source"], c["meta"])
+        key = (c["source"], c["meta"]) 
         if key in seen:
             continue
         seen.add(key)
