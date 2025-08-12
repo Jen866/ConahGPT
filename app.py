@@ -172,11 +172,9 @@ def list_files_prefilter(shared_drive_id, question_words):
     files = list_files(shared_drive_id)
     if not files:
         return []
-    # keep files whose name overlaps with the question words
     def score(f):
         name_words = words_set(f["name"])
         return len(name_words & question_words)
-    # score and sort; keep top MAX_FILES; if all zero, just take first MAX_FILES
     files_scored = sorted(files, key=score, reverse=True)
     if all(score(f) == 0 for f in files_scored):
         return files_scored[:MAX_FILES]
@@ -215,7 +213,7 @@ def extract_all_chunks_uncached(shared_drive_id, question: str):
 
         elif mime == "application/pdf":
             for page_text, page_no in read_pdf_pages(file_id):
-                for piece in chunk_text(page_text)):
+                for piece in chunk_text(page_text):   # <-- fixed: no extra ')'
                     chunks.append({
                         "text": piece,
                         "source": name,
@@ -228,7 +226,7 @@ def extract_all_chunks_uncached(shared_drive_id, question: str):
 
 def get_chunks(shared_drive_id, question):
     now = time.time()
-    # cache is independent of question (we keep it simple/fast)
+    # simple TTL cache; rebuilt periodically
     if CHUNK_CACHE["data"] is None or now - CHUNK_CACHE["ts"] > CACHE_TTL_SECONDS:
         CHUNK_CACHE["data"] = extract_all_chunks_uncached(shared_drive_id, question)
         CHUNK_CACHE["ts"] = now
@@ -253,7 +251,6 @@ def prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS):
         c_words = words_set(c["text"])
         return len(c_words & q_words)
     ranked = sorted(chunks, key=score, reverse=True)
-    # if all scores are 0, just keep the first n to limit memory
     if all(score(c) == 0 for c in ranked):
         return ranked[:min(n, len(ranked))]
     return ranked[:min(n, len(ranked))]
@@ -261,13 +258,11 @@ def prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS):
 def get_relevant_chunks(question, chunks, top_k=TOP_K):
     if not chunks:
         return []
-    # dedup and prefilter
     chunks = deduplicate_chunks(chunks)
     small = prefilter_chunks(question, chunks, n=PREFILTER_CHUNKS)
     if not small:
         return []
     docs = [c["text"] for c in small]
-    # small TF-IDF to choose final top_k
     vectorizer = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words="english").fit(docs + [question])
     doc_vectors = vectorizer.transform(docs)
     q_vec = vectorizer.transform([question])
