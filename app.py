@@ -285,11 +285,11 @@ def retrieve_top_chunks(question: str, max_files: int = 200, top_k: int = 3) -> 
         print("[Retrieve] No files found under container ID. Verify the service account has access to the Shared Drive.")
         return "", []
 
-    # quick prefilter by filename overlap
+    # quick prefilter by filename overlap — add a numeric tiebreaker to avoid dict comparison
     qtok = toks(question)
-    scored = [(-overlap(qtok, f["name"]), f) for f in files]
+    scored = [(-overlap(qtok, f["name"]), i, f) for i, f in enumerate(files)]
     heapq.heapify(scored)
-    chosen = [heapq.heappop(scored)[1] for _ in range(min(max_files, len(scored)))]
+    chosen = [heapq.heappop(scored)[2] for _ in range(min(max_files, len(scored)))]
 
     heap: List[Tuple[int, int, Dict]] = []
     tiebreak = 0
@@ -396,7 +396,6 @@ def handle_mention(channel_id: str, raw_text: str):
     try:
         slack.chat_postMessage(channel=channel_id, text=reply)
     except SlackApiError as e:
-        # ✅ fixed print formatting
         print(f"[Slack] post error: {e.response.get('error')}")
 
 @app.route("/slack/events", methods=["POST"])
