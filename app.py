@@ -52,10 +52,9 @@ if not SLACK_BOT_TOKEN:
     raise ValueError("SLACK_BOT_TOKEN not set.")
 slack = WebClient(token=SLACK_BOT_TOKEN)
 
-# IMPORTANT: This may be a Shared Drive ID (like 0AL5...) OR a Folder ID.
-DRIVE_CONTAINER_ID = os.environ.get("DRIVE_CONTAINER_ID", "").strip()
-if not DRIVE_CONTAINER_ID:
-    raise ValueError("DRIVE_CONTAINER_ID not set (use your shared drive ID 0AL5LG1aWrCL2Uk9PVA).")
+# ✅ Default to your Shared Drive ID if env var is missing (prevents crash)
+DRIVE_CONTAINER_ID = (os.environ.get("DRIVE_CONTAINER_ID") or "0AL5LG1aWrCL2Uk9PVA").strip()
+print(f"[Startup] Using DRIVE_CONTAINER_ID: {DRIVE_CONTAINER_ID}")
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 gemini = genai.GenerativeModel(
@@ -160,6 +159,7 @@ def list_files(container_id: str) -> List[Dict]:
         files = list_in_shared_drive(container_id)
         if files:
             return files
+        print("[List] Shared drive listing returned 0 files; falling back to folder traversal.")
     except Exception as e:
         print(f"[List] Shared drive listing failed: {e}")
     try:
@@ -182,7 +182,6 @@ def iter_gdoc_chunks(file_id: str, name: str) -> Generator[Dict, None, None]:
         content = doc.get("body", {}).get("content", [])
         current_section = "General"
 
-        # iterate with index to safely peek next paragraph
         for i in range(len(content)):
             c = content[i]
             if "paragraph" not in c:
@@ -199,7 +198,6 @@ def iter_gdoc_chunks(file_id: str, name: str) -> Generator[Dict, None, None]:
                 current_section = text
                 continue
 
-            # Q&A pairing
             if text.endswith("?"):
                 ans = ""
                 if i + 1 < len(content) and "paragraph" in content[i + 1]:
@@ -284,7 +282,7 @@ def iter_sheet_chunks(file_id: str, name: str) -> Generator[Dict, None, None]:
 def retrieve_top_chunks(question: str, max_files: int = 200, top_k: int = 3) -> Tuple[str, List[Dict]]:
     files = list_files(DRIVE_CONTAINER_ID)
     if not files:
-        print("[Retrieve] No files found under container ID.")
+        print("[Retrieve] No files found under container ID. Verify the service account has access to the Shared Drive.")
         return "", []
 
     # quick prefilter by filename overlap
@@ -299,7 +297,7 @@ def retrieve_top_chunks(question: str, max_files: int = 200, top_k: int = 3) -> 
     def push(ch: Dict):
         nonlocal heap, tiebreak
         sc = overlap(qtok, ch["text"])
-        if sc < 0:  # defensive
+        if sc < 0:
             sc = 0
         if len(heap) < top_k:
             heapq.heappush(heap, (sc, tiebreak, ch))
@@ -322,7 +320,7 @@ def retrieve_top_chunks(question: str, max_files: int = 200, top_k: int = 3) -> 
         for ch in gen:
             push(ch)
 
-    # Fallback: if no overlap, still use first chunk(s) so Gemini has context
+    # Fallback: ensure Gemini always has at least 1 chunk
     if not heap:
         for f in chosen[:5]:
             mt, fid, name = f["mimeType"], f["id"], f["name"]
@@ -398,7 +396,8 @@ def handle_mention(channel_id: str, raw_text: str):
     try:
         slack.chat_postMessage(channel=channel_id, text=reply)
     except SlackApiError as e:
-        print(f("[Slack] post error: {e.response.get('error')}"))
+        # ✅ fixed print formatting
+        print(f"[Slack] post error: {e.response.get('error')}")
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
